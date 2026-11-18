@@ -1,0 +1,6 @@
+node_modules/
+data/
+*.duckdb
+*.duckdb.wal
+*.log
+.DS_Store

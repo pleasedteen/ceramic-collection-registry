@@ -1,0 +1,23 @@
+{
+  "name": "ceramic-recon",
+  "version": "1.0.0",
+  "description": "市博物馆陶瓷馆藏核对本地 HTTP 服务（TypeScript/Node.js/DuckDB）",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test 'test/**/*.test.js'",
+    "demo": "node scripts/demo.js",
+    "all": "npm run typecheck && npm test && npm run demo"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "duckdb": "^1.4.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}
