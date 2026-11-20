@@ -162,7 +162,10 @@ create table if not exists evidence_events(
   k2 varchar not null,
   confidence double not null,
   evidence varchar not null,
-  outcome varchar not null
+  outcome varchar not null,
+  -- 被剪边记录阻挡它的有效判异（JSON 数组：batchId/k1/k2）；非剪边为空数组。
+  -- 旧库无此列时由下方 ALTER 补上，历史行为 NULL ⇒ 证据不足，查询时单独标出。
+  blocked_by varchar
 );
 create index if not exists idx_group_events_ver on group_events(version);
 create index if not exists idx_membership_events_ver on membership_events(version);
@@ -187,6 +190,14 @@ where withdrawn_at is null;
 async function initDatabase(db) {
   for (const stmt of SCHEMA.split(';').map((s) => s.trim()).filter(Boolean)) {
     await db.run(stmt);
+  }
+  // 旧库升级：早期 evidence_events 没有 blocked_by 列，补列后历史行保持 NULL，
+  // 查询侧据此把“旧库证据不足”的剪边单独标出，不臆造判异批次。
+  const cols = await db.all(
+    "select column_name from information_schema.columns where table_name = 'evidence_events'"
+  );
+  if (!cols.some((c) => c.column_name === 'blocked_by')) {
+    await db.run('alter table evidence_events add column blocked_by varchar');
   }
 }
 

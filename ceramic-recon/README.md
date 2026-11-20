@@ -25,7 +25,7 @@ npm run all
 ```
 
 - `npm run typecheck`：TypeScript 对 `src/`、`scripts/` 做严格空值检查（不产出文件）。
-- `npm test`：Node 内置 test runner，15 个用例（规范化、固定基准、撤回、审计、崩溃回滚、HTTP 端到端）。
+- `npm test`：Node 内置 test runner，18 个用例（规范化、固定基准、撤回、审计、归并说明与剪边、旧库升级、崩溃回滚、HTTP 端到端）。
 - `npm run demo`：重放固定基准，并在加入 5 万条无关记录前后执行同一串 20 次小批变更，输出可核对归组与三项工作量。
 
 ## 数据模型
@@ -35,7 +35,7 @@ npm run all
 - `batches`：所有导入/更正/判异/撤回批次及撤回状态，馆员可撤回任一导入批次或异件判定，其余有效提交继续参与。
 - `block_name` / `block_mark`：按规范化品名、刻款维护的分块索引，支撑增量发布按索引定位候选而不扫描全库。
 - `live_groups` / `live_members`：最新**完整发布**的物化当前态，所有查询只读到这里，未发布的工作区变更不可见。
-- `group_events` / `membership_events` / `evidence_events`：只追加的历史事件，支持按版本回放、审计合并/拆分依据、旧馆藏逐条追查。
+- `group_events` / `membership_events` / `evidence_events`：只追加的历史事件，支持按版本回放、审计归并说明（扩员/拆分/合并）与剪边依据、旧馆藏逐条追查。其中 `evidence_events.blocked_by` 记录剪边被哪些判异批次挡下（旧库升级时补列，历史行为 NULL）。
 - `publications` / `recompute_log`：发布版本元数据与每次发布的工作量（读取来源记录数、匹配比较数、新增历史馆藏行数）。
 - `group_lineage`：每个馆藏编号的诞生/关闭版本；成员未变的馆藏沿用原编号。
 
@@ -115,11 +115,36 @@ npm run all
 | GET | `/groups/:gid` | 单个馆藏及匹配证据 |
 | GET | `/records/:source\|:id` | 单条记录当前归属；已撤回返回 `status=withdrawn` |
 | GET | `/versions` | 发布版本列表与工作量 |
-| GET | `/versions/:v` | 任一版的馆藏、字段出处、合并/拆分依据、剪开边 |
+| GET | `/versions/:v` | 任一版的馆藏、字段出处、按成员去向的归并说明、剪开边及阻挡它的判异批次 |
 | GET | `/audit/groups/:gid?atVersion=:v` | 旧馆藏逐条成员的当前归属/撤回状态与跨版本归属链 |
 | GET | `/audit/workload` | 每次发布的三项工作量 |
 | GET | `/audit/lineage` | 馆藏编号诞生/关闭版本 |
 | GET | `/health` | 健康检查与当前版本号 |
+
+## 版本详情：归并说明与剪边
+
+`GET /versions/:v` 按**成员去向**（上一版成员是留在本馆藏、迁往他馆藏，还是本馆藏纳入新记录）给出每个馆藏的 `lineageBasis`：
+
+| kind | 含义 | 判据 |
+| --- | --- | --- |
+| `new` | 新建 | 上一版没有成员落在本馆藏 |
+| `unchanged` | 不变 | 只有一个前身、成员全部留下且无新增 |
+| `growth` | 扩员 | 只有一个前身、其成员全部留下，另纳入新记录 |
+| `split` | 拆分 | 只有一个前身，但其成员有一部分迁往他馆藏 |
+| `merge` | 合并 | 有两个及以上前身 |
+
+`lineageBasis.contributingEdges` **只列真正促成归并的匹配边**（处理结果为 `joined`）；两端已连通的冗余边不计入依据，但仍保留在 `GET /groups/:gid` 的证据里（`outcome=redundant`）。`addedMembers` / `departedMembers` 给出本次纳入与迁出的成员。
+
+`cutEdges` 列出本版被剪开的匹配边，`blockedBy` 说明阻挡它的有效判异：
+
+- `blockedBy`: `[{ batchId, k1, k2 }]`，即哪条异件判定（哪一批）导致该边被剪；
+  间接阻挡（该边本身不是判异对，但合并会让某条判异两端同组）也如实给出源判异对。
+- `blockedByBatchIds`：上述批次编号去重后的数组。
+- `reason`：可直接展示的中文说明。
+
+**按版本留痕**：归并说明与剪边依据一律取**该版本发布时**记录的事件，因此撤回判异或撤回更正后，旧版仍按发布时的依据展示，不随后续撤回改写。
+
+**旧库证据不足**：早期数据库的 `evidence_events` 没有 `blocked_by` 列，升级时补列、历史行保持 NULL。这类版本 `evidenceIncomplete=true`：剪边条目 `blockedBy` 为空、`reason` 标为“旧库证据不足”，归并依据里的边 `verified=false`（无法确认是否为冗余边）。这类内容单独标出，系统不会臆造判异批次。
 
 `/groups` 响应示例：
 

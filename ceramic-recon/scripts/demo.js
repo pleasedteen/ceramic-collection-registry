@@ -105,6 +105,90 @@ async function addNoise(db, mutex, n) {
   return made;
 }
 
+// 展示某一版的归并说明与剪边：归并种类按成员去向区分，剪边标出阻挡它的判异批次
+async function showVersionLineage(db, version, title) {
+  const d = await queries.versionDetail(db, version);
+  console.log(`\n【${title}】v${version}`);
+  if (!d) {
+    console.log('  （版本不存在）');
+    return;
+  }
+  for (const g of d.groups) {
+    const b = g.lineageBasis;
+    console.log(`  ${g.gid}  成员=[${g.members.join(', ')}]  归并=${b.label}(${b.kind})`);
+    if (b.predecessors.length) {
+      console.log(`     前身=${b.predecessors.map((p) => p.gid).join(', ')}`);
+    }
+    if (b.addedMembers.length) console.log(`     纳入=${b.addedMembers.join(', ')}`);
+    if (b.departedMembers.length) console.log(`     迁出=${b.departedMembers.join(', ')}`);
+    const edges = b.contributingEdges
+      .map((e) => `${e.k1}≈${e.k2}(置信${e.confidence})`)
+      .join('；');
+    console.log(`     促成归并的匹配边=${edges || '（无）'}`);
+  }
+  if (!d.cutEdges.length) {
+    console.log('  剪开边：无');
+  } else {
+    console.log('  剪开边：');
+    for (const e of d.cutEdges) {
+      console.log(`     ${e.k1}≈${e.k2}(置信${e.confidence}) —— ${e.reason}`);
+    }
+  }
+}
+
+// 本地用例：先 AB 同组、再加 C 扩员、再间接判异拆开
+async function demoLineage() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ceramic-lineage-'));
+  const db = openDatabase(path.join(dir, 'lineage.duckdb'));
+  await initDatabase(db);
+  const mutex = new engine.Mutex();
+  await engine.importBatch(db, mutex, {
+    batchId: 'ln-A', source: 'registry',
+    records: [{ id: 'A', name: '青釉梅瓶', mark: '甲款', height: 20 }],
+  });
+  await engine.importBatch(db, mutex, {
+    batchId: 'ln-B', source: 'repair',
+    records: [{ id: 'B', name: '青釉梅缾', mark: '甲款', material: '瓷', height: 20 }],
+  });
+  await engine.publish(db, mutex, { reason: 'AB 同组' });
+  await engine.importBatch(db, mutex, {
+    batchId: 'ln-C', source: 'inventory',
+    records: [{ id: 'C', name: '青釉梅缾', mark: '甲款', height: 20.4 }],
+  });
+  await engine.publish(db, mutex, { reason: '纳入 C' });
+  await showVersionLineage(db, 2, '扩员：AB 纳入 C，应为“扩员”而非“拆分”');
+
+  // 判 A 与 C 异件：C≈B 不是判异对，却被 hAC 间接挡下
+  await engine.judgeHeterology(db, mutex, {
+    batchId: 'ln-hAC', source1: 'registry', id1: 'A', source2: 'inventory', id2: 'C',
+  });
+  await engine.publish(db, mutex, { reason: '判 A 与 C 异件' });
+  await showVersionLineage(db, 3, '间接判异：ABC 拆为 AB 与 C，剪边标出 hAC');
+
+  await engine.withdrawBatch(db, mutex, { batchId: 'ln-hAC' });
+  await engine.publish(db, mutex, { reason: '撤回判异' });
+  await showVersionLineage(db, 4, '撤回判异：AB 与 C 合并回 ABC');
+  // 撤回后旧版说明仍按发布时依据展示
+  await showVersionLineage(db, 3, '撤回后再看旧版 v3：仍按发布时的判异依据展示');
+
+  const v3 = await queries.versionDetail(db, 3);
+  if (!v3) throw new Error('旧版 v3 不存在');
+  const indirect = v3.cutEdges.find(
+    (e) => [e.k1, e.k2].sort().join('#') === 'inventory|C#repair|B'
+  );
+  const ok =
+    v3.groups.every((g) => g.lineageBasis.kind === 'split') &&
+    indirect &&
+    indirect.blockedByBatchIds.includes('ln-hAC') &&
+    v3.cutEdges.every((e) => !e.evidenceIncomplete);
+  console.log(
+    ok
+      ? '\n结论 ✓：扩员与拆分按成员去向正确区分；间接被剪边标明阻挡批次；撤回后旧版依据不变。'
+      : '\n结论 ✗：归并说明或剪边依据不符合预期。'
+  );
+  return ok;
+}
+
 function summarize(log) {
   return log.map((r) => ({
     v: r.version,
@@ -116,6 +200,10 @@ function summarize(log) {
 
 async function main() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ceramic-demo-'));
+
+  // ---------- 第零部分：归并说明与剪边核对 ----------
+  hr('第零部分：归并说明（扩员/拆分/合并）与判异剪边核对');
+  const lineageOk = await demoLineage();
 
   // ---------- 第一部分：固定基准重放 ----------
   hr('第一部分：固定基准重放');
@@ -230,6 +318,7 @@ async function main() {
   }
 
   if (!invariantHolds) process.exit(1);
+  if (!lineageOk) process.exit(1);
 }
 
 main().catch((e) => {

@@ -68,6 +68,33 @@ test('HTTP 全流程：导入→发布→判异→查询→审计→撤回', asy
 
     const detail = await c.get('/versions/2');
     assert.ok(Array.isArray(detail.cutEdges));
+    assert.equal(detail.evidenceIncomplete, false);
+    // 归并说明按成员去向：AB 与 C 是从原三件拆分而来，均为“拆分”
+    assert.deepEqual(
+      detail.groups.map((g) => g.lineageBasis.kind).sort(),
+      ['split', 'split']
+    );
+    assert.ok(detail.groups.every((g) => g.lineageBasis.label === '拆分'));
+    // 剪边标明阻挡它的判异批次（含 C 与 B 这种被 hAC 间接挡下的边）
+    assert.equal(detail.cutEdges.length, 2);
+    for (const e of detail.cutEdges) {
+      assert.deepEqual(e.blockedByBatchIds, ['hAC']);
+      assert.match(e.reason, /hAC/);
+    }
+    const indirect = detail.cutEdges.find(
+      (e) => [e.k1, e.k2].sort().join('#') === 'inventory|C#repair|B'
+    );
+    assert.deepEqual(indirect.blockedBy, [{ batchId: 'hAC', k1: 'inventory|C', k2: 'registry|A' }]);
+
+    // 单个馆藏也带馆内匹配证据与被剪边，馆员可直接查到拦截批次
+    const groupDetail = await c.get(`/groups/${detail.groups[0].gid}`);
+    assert.ok(Array.isArray(groupDetail.group.matchEvidence));
+    assert.ok(groupDetail.group.matchEvidence.every((e) => e.outcome !== 'cut'));
+    assert.ok(Array.isArray(groupDetail.group.cutEdges));
+    assert.ok(
+      groupDetail.group.cutEdges.every((e) => e.blockedByBatchIds.includes('hAC'))
+    );
+
     const trace = await c.get('/audit/groups/G000001?atVersion=1');
     assert.equal(trace.members.length, 3);
     const workload = await c.get('/audit/workload');

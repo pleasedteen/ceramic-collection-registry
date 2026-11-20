@@ -181,6 +181,131 @@ test('审计：版本详情含合并/拆分依据，旧馆藏可逐条追查', a
   assert.ok(aTrace.chain.some((c) => c.gid));
 });
 
+test('归并说明按成员去向区分扩员/拆分/合并，只列促成归并的匹配边', async () => {
+  const { db, mutex } = await freshDb();
+  // 先 AB 同组发布，再纳入 C → 扩员（不是拆分）
+  await engine.importBatch(db, mutex, {
+    batchId: 'bA', source: 'registry',
+    records: [{ id: 'A', name: '青釉梅瓶', mark: '甲款', height: 20 }],
+  });
+  await engine.importBatch(db, mutex, {
+    batchId: 'bB', source: 'repair',
+    records: [{ id: 'B', name: '青釉梅缾', mark: '甲款', material: '瓷', height: 20 }],
+  });
+  await engine.publish(db, mutex); // v1: AB
+  await engine.importBatch(db, mutex, {
+    batchId: 'bC', source: 'inventory',
+    records: [{ id: 'C', name: '青釉梅缾', mark: '甲款', height: 20.4 }],
+  });
+  await engine.publish(db, mutex); // v2: ABC
+
+  const v2 = await queries.versionDetail(db, 2);
+  assert.equal(v2.groups.length, 1);
+  assert.equal(v2.groups[0].lineageBasis.kind, 'growth');
+  assert.equal(v2.groups[0].lineageBasis.label, '扩员');
+  assert.deepEqual(v2.groups[0].lineageBasis.addedMembers, ['inventory|C']);
+  assert.deepEqual(v2.groups[0].lineageBasis.departedMembers, []);
+  // 三条两两匹配中只有两条真正促成归并；第三条两端已连通，是冗余边
+  const contributed = v2.groups[0].lineageBasis.contributingEdges
+    .map((e) => [e.k1, e.k2].sort().join('#'))
+    .sort();
+  assert.deepEqual(contributed, ['inventory|C#repair|B', 'registry|A#repair|B']);
+  assert.ok(v2.groups[0].lineageBasis.contributingEdges.every((e) => e.verified));
+  // 全量证据里仍保留冗余边，但不计入归并依据
+  const v2Evidence = await db.all(
+    'select k1, k2, outcome from evidence_events where version = 2 order by event_id'
+  );
+  assert.equal(v2Evidence.length, 3);
+  assert.equal(v2Evidence.filter((e) => e.outcome === 'redundant').length, 1);
+
+  // 判 A 与 C 异件 → ABC 拆成 AB 与 C
+  await engine.judgeHeterology(db, mutex, {
+    batchId: 'hAC', source1: 'registry', id1: 'A', source2: 'inventory', id2: 'C',
+  });
+  await engine.publish(db, mutex); // v3
+  const v3 = await queries.versionDetail(db, 3);
+  const v3Kinds = v3.groups.map((g) => g.lineageBasis.kind);
+  assert.deepEqual(v3Kinds, ['split', 'split']);
+
+  // 被剪边标明阻挡它的判异批次：C#B 不是直接判异对，而是被 hAC 间接挡下
+  assert.equal(v3.cutEdges.length, 2);
+  const indirect = v3.cutEdges.find(
+    (e) => [e.k1, e.k2].sort().join('#') === 'inventory|C#repair|B'
+  );
+  assert.deepEqual(indirect.blockedByBatchIds, ['hAC']);
+  assert.deepEqual(indirect.blockedBy, [
+    { batchId: 'hAC', k1: 'inventory|C', k2: 'registry|A' },
+  ]);
+  assert.equal(indirect.evidenceIncomplete, false);
+  assert.match(indirect.reason, /hAC/);
+  const direct = v3.cutEdges.find(
+    (e) => [e.k1, e.k2].sort().join('#') === 'inventory|C#registry|A'
+  );
+  assert.deepEqual(direct.blockedByBatchIds, ['hAC']);
+
+  // 撤回判异 → AB 与 C 合并回 ABC，说明为“合并”
+  await engine.withdrawBatch(db, mutex, { batchId: 'hAC' });
+  await engine.publish(db, mutex); // v4
+  const v4 = await queries.versionDetail(db, 4);
+  assert.equal(v4.groups[0].lineageBasis.kind, 'merge');
+  assert.equal(v4.groups[0].lineageBasis.predecessors.length, 2);
+  assert.equal(v4.groups[0].lineageBasis.contributingEdges.length, 2);
+  assert.equal(v4.cutEdges.length, 0);
+
+  // 撤回判异后，旧版（v3）说明仍按发布时的依据展示
+  const v3again = await queries.versionDetail(db, 3);
+  assert.deepEqual(
+    v3again.groups.map((g) => g.lineageBasis.kind),
+    ['split', 'split']
+  );
+  assert.equal(v3again.cutEdges.length, 2);
+  assert.ok(v3again.cutEdges.every((e) => e.blockedByBatchIds.includes('hAC')));
+});
+
+test('旧库证据不足的剪边与归并条目单独标出', async () => {
+  // 模拟早期库：evidence_events 无 blocked_by 列，历史行补列后为 NULL
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ceramic-legacy-'));
+  const file = path.join(dir, 'legacy.duckdb');
+  const { default: duckdb } = await import('duckdb');
+  const raw = new duckdb.Database(file);
+  const run = (sql) =>
+    new Promise((resolve, reject) => raw.run(sql, (e) => (e ? reject(e) : resolve())));
+  await run(
+    `create table evidence_events(
+       event_id bigint, version integer, k1 varchar, k2 varchar,
+       confidence double, evidence varchar, outcome varchar)`
+  );
+  await new Promise((r) => raw.close(r));
+
+  const db = openDatabase(file);
+  await initDatabase(db); // 迁移补列
+  await db.run(
+    "insert into publications(version, created_at, reason, stats) values(1, 1, '旧库发布', '{}')"
+  );
+  await db.run(
+    `insert into group_events(version, gid, op, fields, members) values
+     (1, 'G000001', 'open', '{"fields":{},"fieldSources":{}}', '["registry|A","repair|B"]')`
+  );
+  await db.run(
+    `insert into evidence_events(event_id, version, k1, k2, confidence, evidence, outcome) values
+     (1, 1, 'registry|A', 'repair|B', 0.9, '{}', 'joined'),
+     (2, 1, 'inventory|C', 'repair|B', 0.8, '{}', 'cut')`
+  );
+
+  const detail = await queries.versionDetail(db, 1);
+  assert.equal(detail.evidenceIncomplete, true);
+  // 旧库 joined 行无法确认是否冗余，条目保留但标注未核实
+  assert.equal(detail.groups[0].lineageBasis.contributingEdges.length, 1);
+  assert.equal(detail.groups[0].lineageBasis.contributingEdges[0].verified, false);
+  assert.equal(detail.groups[0].lineageBasis.evidenceIncomplete, true);
+  // 剪边缺判异批次 → 单列标出，不臆造阻挡批次
+  assert.equal(detail.cutEdges.length, 1);
+  assert.equal(detail.cutEdges[0].evidenceIncomplete, true);
+  assert.deepEqual(detail.cutEdges[0].blockedBy, []);
+  assert.deepEqual(detail.cutEdges[0].blockedByBatchIds, []);
+  assert.match(detail.cutEdges[0].reason, /旧库证据不足/);
+});
+
 test('发布中断（提交前崩溃）回滚，重启后状态一致', async () => {
   const { db, mutex } = await freshDb();
   await seedBaseline(db, mutex);

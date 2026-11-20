@@ -409,45 +409,95 @@ class UnionFind {
 //   逐条合并：异件对的匹配边直接剪开；其余边若合并会使某条有效异件判定两端
 //   落入同一组，也剪开跳过。冲突因此按置信度优先、同分按固定公开规则处理，
 //   且异件两端必属不同馆藏。
-function partitionGroups(keys, sortedMatchEdges, heterologySet) {
+//   每条边记录处理结果：
+//     joined   —— 真正合并了两个分量（促成归并）
+//     redundant —— 两端已在同一分量，不改变归组（不作为归并依据）
+//     cut      —— 被有效判异挡下，blockedBy 给出阻挡它的判异批次
+//     skipped  —— 端点不在本子图（本轮未参与分区）
+function partitionGroups(keys, sortedMatchEdges, heterologyEdges) {
   const uf = new UnionFind(keys);
   const cutEdges = [];
+  const outcomes = new Map(); // token -> { outcome, blockedBy: [{batchId,k1,k2}] }
 
-  const heteroByNode = new Map(keys.map((k) => [k, new Set()]));
-  for (const token of heterologySet) {
-    const [a, b] = token.split('#');
-    if (heteroByNode.has(a) && heteroByNode.has(b)) {
-      heteroByNode.get(a).add(b);
-      heteroByNode.get(b).add(a);
+  const blockersByToken = new Map(); // token -> [{batchId,k1,k2}]
+  const heteroByNode = new Map(keys.map((k) => [k, new Map()])); // k -> (other -> tokens[])
+  for (const e of heterologyEdges) {
+    if (!heteroByNode.has(e.k1) || !heteroByNode.has(e.k2)) continue;
+    const token = [e.k1, e.k2].sort().join('#');
+    if (!blockersByToken.has(token)) {
+      blockersByToken.set(token, []);
+      if (!heteroByNode.get(e.k1).has(e.k2)) heteroByNode.get(e.k1).set(e.k2, []);
+      if (!heteroByNode.get(e.k2).has(e.k1)) heteroByNode.get(e.k2).set(e.k1, []);
+      heteroByNode.get(e.k1).get(e.k2).push(token);
+      heteroByNode.get(e.k2).get(e.k1).push(token);
     }
+    blockersByToken.get(token).push({ batchId: e.batch_id, k1: e.k1, k2: e.k2 });
   }
 
-  const wouldViolate = (k1, k2) => {
+  // 若把 k1、k2 所在分量合并，会违反哪些有效判异（返回涉及的分量内判异 token）
+  const violationTokens = (k1, k2) => {
     const r1 = uf.find(k1);
     const r2 = uf.find(k2);
-    if (r1 === r2) return false;
+    if (r1 === r2) return null;
     const members1 = new Set(keys.filter((k) => uf.find(k) === r1));
     const members2 = new Set(keys.filter((k) => uf.find(k) === r2));
+    const tokens = new Set();
     for (const a of members1) {
-      for (const b of heteroByNode.get(a)) {
-        if (members2.has(b)) return true;
+      const others = heteroByNode.get(a);
+      if (!others) continue;
+      for (const [b, toks] of others) {
+        if (members2.has(b)) toks.forEach((t) => tokens.add(t));
       }
     }
-    return false;
+    return [...tokens];
+  };
+
+  // 阻挡信息固定排序并去重（按批次、再端点），保证同一输入可复算
+  const blockersOf = (tokens) => {
+    const seen = new Set();
+    const out = [];
+    for (const t of [...tokens].sort()) {
+      for (const b of blockersByToken.get(t) || []) {
+        const id = `${b.batchId}#${b.k1}#${b.k2}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push(b);
+      }
+    }
+    out.sort((a, b) => {
+      if (a.batchId !== b.batchId) return a.batchId < b.batchId ? -1 : 1;
+      if (a.k1 !== b.k1) return a.k1 < b.k1 ? -1 : 1;
+      if (a.k2 !== b.k2) return a.k2 < b.k2 ? -1 : 1;
+      return 0;
+    });
+    return out;
   };
 
   for (const e of sortedMatchEdges) {
-    if (!uf.parent.has(e.k1) || !uf.parent.has(e.k2)) continue;
     const token = [e.k1, e.k2].sort().join('#');
-    if (heterologySet.has(token)) {
-      cutEdges.push(e); // 异件凌驾匹配
+    if (!uf.parent.has(e.k1) || !uf.parent.has(e.k2)) {
+      outcomes.set(token, { outcome: 'skipped', blockedBy: [] });
       continue;
     }
-    if (wouldViolate(e.k1, e.k2)) {
+    if (blockersByToken.has(token)) {
+      // 异件凌驾匹配：直接剪开
+      outcomes.set(token, { outcome: 'cut', blockedBy: blockersOf([token]) });
+      cutEdges.push(e);
+      continue;
+    }
+    if (uf.find(e.k1) === uf.find(e.k2)) {
+      // 两端已连通：这条边没有促成新的归并
+      outcomes.set(token, { outcome: 'redundant', blockedBy: [] });
+      continue;
+    }
+    const violated = violationTokens(e.k1, e.k2);
+    if (violated && violated.length) {
+      outcomes.set(token, { outcome: 'cut', blockedBy: blockersOf(violated) });
       cutEdges.push(e);
       continue;
     }
     uf.union(e.k1, e.k2);
+    outcomes.set(token, { outcome: 'joined', blockedBy: [] });
   }
 
   const groupsMap = new Map();
@@ -458,7 +508,7 @@ function partitionGroups(keys, sortedMatchEdges, heterologySet) {
   }
   const groups = [...groupsMap.values()].map((g) => g.sort());
   groups.sort((a, b) => (a[0] < b[0] ? -1 : 1));
-  return { groups, cutEdges };
+  return { groups, cutEdges, outcomes };
 }
 
 function isBlank(v) {
@@ -520,7 +570,7 @@ async function recompute(db, affectedHint, firstPublish) {
     affected = new Set(all.map((r) => keyOf(r.source, r.source_id)));
   }
   // 异件边端点始终纳入，保证判异约束参与分区
-  const edgesAll = await db.all('select k1, k2 from v_active_heterology');
+  const edgesAll = await db.all('select batch_id, k1, k2 from v_active_heterology');
   for (const e of edgesAll) {
     affected.add(e.k1);
     affected.add(e.k2);
@@ -634,19 +684,17 @@ async function recompute(db, affectedHint, firstPublish) {
     return 0;
   });
 
-  const heterologySet = new Set(
-    edgesAll
-      .filter((e) => affected.has(e.k1) && affected.has(e.k2))
-      .map((e) => [e.k1, e.k2].sort().join('#'))
+  const heterologyEdges = edgesAll.filter(
+    (e) => affected.has(e.k1) && affected.has(e.k2)
   );
 
   // 仅在受影响子图上分区；scope 中非受影响成员只作比较参照，归属保持不变
   const affectedKeys = [...affected].filter((k) => recMap.has(k)).sort();
-  const { groups: newGroups, cutEdges: cutEdgesAll } = partitionGroups(
-    affectedKeys,
-    matchEdges,
-    heterologySet
-  );
+  const {
+    groups: newGroups,
+    cutEdges: cutEdgesAll,
+    outcomes: edgeOutcomes,
+  } = partitionGroups(affectedKeys, matchEdges, heterologyEdges);
   newGroups.sort((a, b) => (a[0] < b[0] ? -1 : 1));
 
   // 成员未变的馆藏沿用编号：用上一版成员签名 -> gid
@@ -677,8 +725,12 @@ async function recompute(db, affectedHint, firstPublish) {
       newLineage.push([gid, null]);
     }
     const { fields, fieldSources } = resolveFields(members, recMap);
+    // 归并依据只收真正促成归并的匹配边：两端已连通的冗余边不算依据
     const internalEdges = matchEdges.filter(
-      (e) => members.includes(e.k1) && members.includes(e.k2)
+      (e) =>
+        members.includes(e.k1) &&
+        members.includes(e.k2) &&
+        edgeOutcomes.get([e.k1, e.k2].sort().join('#'))?.outcome === 'joined'
     );
     resultGroups.push({ gid, members, fields, fieldSources, matchEvidence: internalEdges });
   }
@@ -696,6 +748,7 @@ async function recompute(db, affectedHint, firstPublish) {
     resultGroups,
     recMap,
     cutEdgesAll,
+    edgeOutcomes,
     matchEdges,
     prevK2Gid,
     prevGid2Members,
@@ -773,6 +826,16 @@ async function doPublish(db, reason) {
         JSON.stringify({ fields: g.fields, fieldSources: g.fieldSources }),
         JSON.stringify(g.members),
       ]);
+    } else {
+      // 沿用编号的馆藏也留一条 change 事件，记录本版实际展示的字段，
+      // 否则按版本回放会一直显示诞生时的旧字段。
+      groupEventRows.push([
+        version,
+        g.gid,
+        'change',
+        JSON.stringify({ fields: g.fields, fieldSources: g.fieldSources }),
+        null,
+      ]);
     }
     const prevMembers = new Set(r.prevGid2Members.get(g.gid) || []);
     for (const k of g.members) {
@@ -815,23 +878,25 @@ async function doPublish(db, reason) {
   await insertChunked(db, 'membership_events', ['version', 'k', 'gid', 'op'], leaveRows, '(?, ?, ?, ?)');
   await insertChunked(db, 'membership_events', ['version', 'k', 'gid', 'op'], joinRows, '(?, ?, ?, ?)');
 
-  // 4) 证据留痕：本次比较产生的匹配边（joined）与剪开边（cut）
-  const cutToken = new Set(r.cutEdgesAll.map((e) => [e.k1, e.k2].sort().join('#')));
+  // 4) 证据留痕：本次比较产生的每条匹配边都留结果。joined 促成归并；redundant
+  //    两端已连通、不改变归组；cut 记录阻挡它的有效判异批次；skipped 端点不在子图。
   const evidenceRows = [];
   for (const e of r.matchEdges) {
     const token = [e.k1, e.k2].sort().join('#');
+    const o = r.edgeOutcomes.get(token) || { outcome: 'skipped', blockedBy: [] };
     evidenceRows.push([
       version, e.k1, e.k2, e.confidence,
       JSON.stringify(e.evidence),
-      cutToken.has(token) ? 'cut' : 'joined',
+      o.outcome,
+      JSON.stringify(o.blockedBy || []),
     ]);
   }
   await insertChunked(
     db,
     'evidence_events',
-    ['version', 'k1', 'k2', 'confidence', 'evidence', 'outcome'],
+    ['version', 'k1', 'k2', 'confidence', 'evidence', 'outcome', 'blocked_by'],
     evidenceRows,
-    '(?, ?, ?, ?, ?, ?)'
+    '(?, ?, ?, ?, ?, ?, ?)'
   );
 
   const stats = { ...r.metrics, groupCount: keepCount + r.resultGroups.length };

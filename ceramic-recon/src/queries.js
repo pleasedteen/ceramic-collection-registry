@@ -60,16 +60,31 @@ async function getGroup(db, gid) {
   const rows = await db.all('select * from live_groups where gid = ?', [gid]);
   if (!rows.length) return null;
   const members = await db.all('select k from live_members where gid = ? order by k', [gid]);
+  const memberSet = new Set(members.map((m) => m.k));
   const evidence = await db.all(
-    'select k1, k2, confidence, evidence, outcome from evidence_events where version = ? and (k1 in (select k from live_members where gid = ?)) order by k1, k2',
-    [ver.version, gid]
+    'select * from evidence_events where version = ? order by k1, k2',
+    [ver.version]
   );
+  const shaped = evidence.map(shapeEvidenceRow);
   return {
     version: ver.version,
     group: {
       ...shapeGroup(rows[0]),
       members: members.map((m) => m.k),
-      matchEvidence: evidence.map((e) => ({ ...e, evidence: JSON.parse(e.evidence) })),
+      // 馆藏内匹配证据：两端都在本馆藏的边（joined 真正促成归并，redundant 为冗余）
+      matchEvidence: shaped.filter((e) => memberSet.has(e.k1) && memberSet.has(e.k2)),
+      // 被剪边：只要有一端在本馆藏就列出，便于查“哪条判异拦下了本馆藏的去路”
+      cutEdges: shaped
+        .filter((e) => e.outcome === 'cut' && (memberSet.has(e.k1) || memberSet.has(e.k2)))
+        .map((e) => ({
+          k1: e.k1,
+          k2: e.k2,
+          confidence: e.confidence,
+          evidence: e.evidence,
+          blockedBy: e.blockedBy,
+          blockedByBatchIds: e.blockedByBatchIds,
+          evidenceIncomplete: e.evidenceIncomplete,
+        })),
     },
   };
 }
@@ -95,10 +110,12 @@ async function getRecord(db, source, id) {
     [source, id]
   );
   const evidence = await db.all(
-    'select k1, k2, confidence, evidence, outcome from evidence_events where version = ? order by k1, k2',
+    'select * from evidence_events where version = ? order by k1, k2',
     [ver.version]
   );
   const rec = recRows[0] || {};
+  const memberSet = new Set(members.map((m) => m.k));
+  const shaped = evidence.map(shapeEvidenceRow);
   return {
     published: true,
     found: true,
@@ -114,12 +131,18 @@ async function getRecord(db, source, id) {
     group: {
       ...shapeGroup(gRow[0]),
       members: members.map((m) => m.k),
-      matchEvidence: evidence
-        .filter((e) => {
-          const ks = members.map((m) => m.k);
-          return ks.includes(e.k1) && ks.includes(e.k2);
-        })
-        .map((e) => ({ ...e, evidence: JSON.parse(e.evidence) })),
+      matchEvidence: shaped.filter((e) => memberSet.has(e.k1) && memberSet.has(e.k2)),
+      cutEdges: shaped
+        .filter((e) => e.outcome === 'cut' && (memberSet.has(e.k1) || memberSet.has(e.k2)))
+        .map((e) => ({
+          k1: e.k1,
+          k2: e.k2,
+          confidence: e.confidence,
+          evidence: e.evidence,
+          blockedBy: e.blockedBy,
+          blockedByBatchIds: e.blockedByBatchIds,
+          evidenceIncomplete: e.evidenceIncomplete,
+        })),
     },
   };
 }
@@ -144,6 +167,14 @@ async function buildVersionSnapshot(db, version) {
         fields: payload.fields || {},
         fieldSources: payload.fieldSources || {},
       });
+    } else if (e.op === 'change') {
+      // 成员未变但字段更新：刷新本版展示的字段，保留成员集合
+      const g = groups.get(e.gid);
+      if (g && e.fields) {
+        const payload = JSON.parse(e.fields);
+        g.fields = payload.fields || g.fields;
+        g.fieldSources = payload.fieldSources || g.fieldSources;
+      }
     } else if (e.op === 'close') {
       groups.delete(e.gid);
     }
@@ -174,46 +205,144 @@ async function buildVersionSnapshot(db, version) {
     .sort((a, b) => (a.members[0] < b.members[0] ? -1 : 1));
 }
 
-// 版本详情：馆藏、字段出处、合并/拆分依据
+// 版本详情：馆藏、字段出处、按成员去向的归并/扩员/拆分依据、被剪边
+const LINEAGE_LABEL = {
+  new: '新建',
+  unchanged: '不变',
+  growth: '扩员',
+  split: '拆分',
+  merge: '合并',
+};
+
+// 版本发布时记录的每条匹配边（含被剪原因）。老版本若没有 blocked_by 列数据，
+// 说明是旧库在补齐该列之前发布的，标记 evidenceIncomplete，不臆造判异批次。
+function shapeEvidenceRow(e) {
+  const raw = e.blocked_by === null || e.blocked_by === undefined ? null : String(e.blocked_by);
+  const blockedBy = raw === null ? [] : JSON.parse(raw);
+  return {
+    k1: e.k1,
+    k2: e.k2,
+    confidence: e.confidence,
+    evidence: JSON.parse(e.evidence),
+    outcome: e.outcome,
+    blockedBy,
+    blockedByBatchIds: blockedBy.map((b) => b.batchId),
+    evidenceIncomplete: raw === null,
+  };
+}
+
+// 按成员去向判定本版馆藏与上一版馆藏的关系。成员去向指：
+//   原馆藏成员是否全部留在本馆藏（留在原馆藏/迁往他馆藏），以及本馆藏是否纳入新成员。
+//   1 个前身且其成员全部留下、仅新增记录 ⇒ 扩员 growth；
+//   1 个前身但其成员有一部分迁走 ⇒ 拆分 split；
+//   ≥2 个前身 ⇒ 合并 merge。
+function describeLineage(group, prevGroups, prevGidByMember) {
+  const memberSet = new Set(group.members);
+  const sourceGids = new Set();
+  const addedMembers = [];
+  for (const m of group.members) {
+    const g = prevGidByMember.get(m);
+    if (g) sourceGids.add(g);
+    else addedMembers.push(m);
+  }
+  const predecessors = [...sourceGids]
+    .sort()
+    .map((gid) => {
+      const pg = prevGroups.find((x) => x.gid === gid);
+      return { gid, shared: pg.members.filter((m) => memberSet.has(m)) };
+    });
+  const departedMembers = [];
+  for (const pg of predecessors) {
+    const prev = prevGroups.find((x) => x.gid === pg.gid);
+    for (const m of prev.members) {
+      if (!memberSet.has(m)) departedMembers.push(m);
+    }
+  }
+
+  let kind;
+  if (sourceGids.size === 0) kind = 'new';
+  else if (sourceGids.size >= 2) kind = 'merge';
+  else {
+    const only = prevGroups.find((x) => x.gid === predecessors[0].gid);
+    const keptAll = only.members.every((m) => memberSet.has(m));
+    if (!keptAll) kind = 'split';
+    else if (addedMembers.length > 0) kind = 'growth';
+    else kind = 'unchanged';
+  }
+  return {
+    kind,
+    label: LINEAGE_LABEL[kind],
+    predecessors,
+    addedMembers: addedMembers.sort(),
+    departedMembers: departedMembers.sort(),
+  };
+}
+
 async function versionDetail(db, version) {
   const row = await getVersionRow(db, version);
   if (!row) return null;
   const groups = await buildVersionSnapshot(db, version);
   const prevGroups = version > 1 ? await buildVersionSnapshot(db, version - 1) : [];
+  const prevGidByMember = new Map();
+  for (const pg of prevGroups) for (const m of pg.members) prevGidByMember.set(m, pg.gid);
+
+  const evidence = await db.all(
+    'select * from evidence_events where version = ? order by event_id',
+    [version]
+  );
+  const shaped = evidence.map(shapeEvidenceRow);
+  const versionEvidenceIncomplete = shaped.some((e) => e.evidenceIncomplete);
+
   const enriched = groups.map((g) => {
     const memberSet = new Set(g.members);
-    const hits = prevGroups
-      .filter((pg) => pg.members.some((m) => memberSet.has(m)))
-      .map((pg) => ({ gid: pg.gid, shared: pg.members.filter((m) => memberSet.has(m)) }));
-    const basis = { kind: 'new', predecessors: hits };
-    if (hits.length > 1) basis.kind = 'merge';
-    else if (hits.length === 1) {
-      const prev = prevGroups.find((x) => x.gid === hits[0].gid);
-      const prevSize = prev ? prev.members.length : 0;
-      basis.kind =
-        hits[0].shared.length === prevSize && hits[0].shared.length === g.members.length
-          ? 'unchanged'
-          : 'split';
-    }
-    return { ...g, lineageBasis: basis };
+    const lineageBasis = describeLineage(g, prevGroups, prevGidByMember);
+    // 归并依据只列真正促成归并的匹配边（两端都在本馆藏内、且处理结果为 joined）；
+    // 两端已连通的冗余边不列入。旧库没有 blocked_by 列，无法区分当时记成 joined
+    // 的边里哪些是冗余边，因此整版标为 evidenceIncomplete，条目保留但标注未核实。
+    const ownEvidence = shaped.filter((e) => memberSet.has(e.k1) && memberSet.has(e.k2));
+    const contributingEdges = ownEvidence
+      .filter((e) => e.outcome === 'joined')
+      .map((e) => ({
+        k1: e.k1,
+        k2: e.k2,
+        confidence: e.confidence,
+        evidence: e.evidence,
+        verified: !e.evidenceIncomplete,
+      }));
+    return {
+      ...g,
+      lineageBasis: {
+        ...lineageBasis,
+        contributingEdges,
+        // 只有本版实际比较过（留下证据边）的馆藏才谈得上证据不足；
+        // 未重算的旧馆藏本版没有新依据，不算证据不足。
+        evidenceIncomplete: versionEvidenceIncomplete && ownEvidence.length > 0,
+      },
+    };
   });
-  const evidence = await db.all('select * from evidence_events where version = ? order by event_id', [
-    version,
-  ]);
-  const cutEdges = evidence
+
+  const cutEdges = shaped
     .filter((e) => e.outcome === 'cut')
     .map((e) => ({
       k1: e.k1,
       k2: e.k2,
       confidence: e.confidence,
-      evidence: JSON.parse(e.evidence),
-      reason: '异件强制拆分，该匹配边被剪开（同分按编号固定规则处理）',
+      evidence: e.evidence,
+      blockedBy: e.blockedBy,
+      blockedByBatchIds: e.blockedByBatchIds,
+      evidenceIncomplete: e.evidenceIncomplete,
+      reason: e.evidenceIncomplete
+        ? '旧库证据不足：该版发布时未记录阻挡它的判异批次'
+        : e.blockedByBatchIds.length
+          ? `被判异批次 ${e.blockedByBatchIds.join('、')} 挡下，该匹配边被剪开（同分按编号固定规则处理）`
+          : '该匹配边被剪开（同分按编号固定规则处理）',
     }));
   return {
     version,
     createdAt: row.created_at,
     reason: row.reason,
     stats: JSON.parse(row.stats),
+    evidenceIncomplete: versionEvidenceIncomplete,
     groups: enriched,
     cutEdges,
   };
