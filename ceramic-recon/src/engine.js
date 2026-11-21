@@ -712,6 +712,54 @@ async function recompute(db, affectedHint, firstPublish) {
   };
 }
 
+// 追查载荷：为本次发布中“已发布有效来源版本”发生变化的记录键写入状态事件。
+// 只有 outbox 键（导入/更正/撤回直接触及的键）的有效版本才可能变化，
+// 因此载荷字节数只取决于本批变更，不随无关馆藏与历史发布规模增长。
+async function writeRecordStateEvents(db, outKeys, recMap, version) {
+  const keys = [...new Set(outKeys)];
+  if (!keys.length) return;
+  // 每个键最近一次已发布状态（按 (k, version) 主键点查，不扫全表）
+  const last = new Map();
+  for (let s = 0; s < keys.length; s += 500) {
+    const part = keys.slice(s, s + 500);
+    const ph = part.map(() => '?').join(',');
+    const rows = await db.all(
+      `select r.k, r.batch_id, r.seq, r.active
+       from record_state_events r
+       join (
+         select k, max(version) as v from record_state_events where k in (${ph}) group by k
+       ) m on m.k = r.k and m.v = r.version`,
+      part
+    );
+    for (const row of rows) last.set(row.k, row);
+  }
+  const inserts = [];
+  for (const k of keys) {
+    const rec = recMap.get(k) || null;
+    const next = rec
+      ? { batch_id: rec.batch_id, seq: rec.seq, active: true }
+      : { batch_id: null, seq: null, active: false };
+    const prev = last.get(k) || null;
+    if (!prev && !next.active) continue; // 从未有已发布有效版本且仍无：无需留痕
+    if (
+      prev &&
+      prev.active === next.active &&
+      prev.batch_id === next.batch_id &&
+      prev.seq === next.seq
+    ) {
+      continue; // 已发布状态未变（如判异、无关更正）：无追查载荷
+    }
+    inserts.push([k, version, next.batch_id, next.seq, next.active]);
+  }
+  await insertChunked(
+    db,
+    'record_state_events',
+    ['k', 'version', 'batch_id', 'seq', 'active'],
+    inserts,
+    '(?, ?, ?, ?, ?)'
+  );
+}
+
 async function publish(db, mutex, body = {}) {
   return mutex.run(() => tx(db, () => doPublish(db, body.reason || null)));
 }
@@ -833,6 +881,9 @@ async function doPublish(db, reason) {
     evidenceRows,
     '(?, ?, ?, ?, ?, ?)'
   );
+
+  // 5) 追查载荷：本批变更中已发布有效来源版本发生变化的记录键
+  await writeRecordStateEvents(db, outbox.map((o) => o.k), r.recMap, version);
 
   const stats = { ...r.metrics, groupCount: keepCount + r.resultGroups.length };
   await db.run('insert into publications(version, created_at, reason, stats) values(?, ?, ?, ?)', [

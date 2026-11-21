@@ -1,5 +1,27 @@
 'use strict';
 const { keyOf, parseKey, SOURCE_LABEL } = require('./db');
+const { ApiError } = require('./engine');
+
+/**
+ * @typedef {Object} RetentionSwitch
+ * @property {number} version 改用生效的发布版
+ * @property {string|null} fromBatchId 此前有效的来源批次
+ * @property {string|null} toBatchId 改用的来源批次
+ * @property {number|null} seq 改用的来源版本序号
+ *
+ * @typedef {Object} RetentionLapse
+ * @property {number} sinceVersion 自该发布版起无有效来源版本
+ * @property {number|null} untilVersion 自该发布版恢复有效；期末仍无则为 null
+ * @property {string|null} lostBatchId 失效前最后一个有效来源批次
+ *
+ * @typedef {Object} RetentionReport
+ * @property {number} fromVersion 起始发布版（成员范围以该版为准）
+ * @property {number} toVersion 期末发布版
+ * @property {Array<{key: string, batchId: string, seq: number}>} retained 期末仍有有效来源版本的成员
+ * @property {Array<{key: string, switches: RetentionSwitch[]}>} switchedBatch 期间改用过其他批次的成员
+ * @property {Array<{key: string, lapses: RetentionLapse[]}>} lapsed 期间曾无有效来源版本的成员
+ * @property {Array<{key: string, reason: string}>} evidenceGaps 旧数据不足、无法核对的成员
+ */
 
 async function latestVersionRow(db) {
   const rows = await db.all('select * from publications order by version desc limit 1');
@@ -219,55 +241,203 @@ async function versionDetail(db, version) {
   };
 }
 
-// 旧馆藏追查：逐条成员 → 当前归属或已撤回，及其跨版本归属链
-async function traceGroup(db, gid, atVersion) {
-  const ver = atVersion
-    ? await getVersionRow(db, atVersion)
-    : await latestVersionRow(db);
-  if (!ver) return null;
-  const thenGroups = await buildVersionSnapshot(db, ver.version);
-  const g = thenGroups.find((x) => x.gid === gid);
-  if (!g) return { found: false, gid };
+/**
+ * @typedef {Object} TraceFound
+ * @property {true} found
+ * @property {string} gid
+ * @property {number} atVersion 起始发布版
+ * @property {number} toVersion 期末发布版
+ * @property {Array<Object>} members 起始版成员逐条当前归属与跨版本归属链
+ * @property {number} currentVersion 最新发布版
+ * @property {RetentionReport} retention 两次发布之间的留存核对
+ *
+ * @typedef {TraceFound | {found: false, gid: string}} TraceResult
+ */
+
+// 旧馆藏追查：以起始发布版（atVersion）的成员范围为基准，核对两次发布之间的留存。
+// 只读取被追查成员自身的历史行（按 gid/k 索引点查），不扫描全量事件历史，
+// 因此扫描行数不随无关馆藏与无变化发布的规模增长。
+/**
+ * @param {any} db
+ * @param {string} gid 被追查的旧馆藏编号
+ * @param {number|null} atVersion 起始发布版（缺省为最新发布版）
+ * @param {number|null} toVersion 期末发布版（缺省为最新发布版）
+ * @returns {Promise<TraceResult|null>} 版本不存在返回 null；起始版不在馆藏生命周期内返回 found=false
+ */
+async function traceGroup(db, gid, atVersion, toVersion) {
   const curVer = await latestVersionRow(db);
-  const allVersions = await db.all('select version from publications order by version');
-  const members = await Promise.all(
-    g.members.map(async (k) => {
-      const { source, id } = parseKey(k);
-      const curLive = await db.all('select gid from live_members where k = ?', [k]);
-      let status;
-      if (curLive.length) {
-        status = { state: 'active', gid: curLive[0].gid };
-      } else {
-        const withdrawn = await db.all(
-          'select 1 from record_versions where source = ? and source_id = ? and withdrawn_at is not null limit 1',
-          [source, id]
-        );
-        status = { state: withdrawn.length ? 'withdrawn' : 'absent' };
-      }
-      // 归属链：逐版回放该成员所在 gid
-      const chain = [];
-      for (const v of allVersions) {
-        const snap = await buildVersionSnapshot(db, v.version);
-        const hit = snap.find((sg) => sg.members.includes(k));
-        chain.push({ version: v.version, gid: hit ? hit.gid : null });
-      }
-      return {
-        key: k,
-        source,
-        sourceLabel: SOURCE_LABEL[source],
-        id,
-        current: status,
-        chain,
-      };
-    })
+  const fromRow = atVersion ? await getVersionRow(db, atVersion) : curVer;
+  if (!fromRow) return null;
+  const toRow = toVersion ? await getVersionRow(db, toVersion) : curVer;
+  if (!toRow) return null;
+  const fromV = fromRow.version;
+  const toV = toRow.version;
+  if (toV < fromV) {
+    throw new ApiError(400, `toVersion(${toV}) 不能早于 atVersion(${fromV})`);
+  }
+  const currentVersion = curVer ? curVer.version : toV;
+
+  // 起始发布版的成员范围：gid 生命周期内成员恒定（成员一变即换新编号），
+  // 由诞生/关闭版本确认该版在生命周期内，再点查 open 事件取成员名单。
+  const lineageRows = await db.all(
+    'select born_version, closed_version from group_lineage where gid = ?',
+    [gid]
   );
+  if (!lineageRows.length) return { found: false, gid };
+  const born = lineageRows[0].born_version;
+  const closed = lineageRows[0].closed_version;
+  if (!(born <= fromV && (closed === null || fromV < closed))) {
+    return { found: false, gid };
+  }
+  const openRows = await db.all(
+    "select members from group_events where gid = ? and op = 'open'",
+    [gid]
+  );
+  if (!openRows.length) return { found: false, gid };
+  const memberKeys = JSON.parse(openRows[0].members).sort();
+
+  /** @type {RetentionReport} */
+  const retention = {
+    fromVersion: fromV,
+    toVersion: toV,
+    retained: [],
+    switchedBatch: [],
+    lapsed: [],
+    evidenceGaps: [],
+  };
+  const members = [];
+  for (const k of memberKeys) {
+    const { source, id } = parseKey(k);
+    const curLive = await db.all('select gid from live_members where k = ?', [k]);
+    let status;
+    if (curLive.length) {
+      status = { state: 'active', gid: curLive[0].gid };
+    } else {
+      const withdrawn = await db.all(
+        'select 1 from record_versions where source = ? and source_id = ? and withdrawn_at is not null limit 1',
+        [source, id]
+      );
+      status = { state: withdrawn.length ? 'withdrawn' : 'absent' };
+    }
+    // 归属链：只回放该成员自身的成员事件（按 k 索引）
+    const memEvents = await db.all(
+      'select version, gid, op from membership_events where k = ? order by event_id',
+      [k]
+    );
+    const chain = buildChain(memEvents, currentVersion);
+    // 该成员 ≤ 期末版的已发布来源版本状态（未发布的变更不产生事件，不计入）
+    const states = await db.all(
+      'select version, batch_id, seq, active from record_state_events where k = ? and version <= ? order by version',
+      [k, toV]
+    );
+    classifyMemberRetention(k, states, fromV, toV, retention);
+    members.push({
+      key: k,
+      source,
+      sourceLabel: SOURCE_LABEL[source],
+      id,
+      current: status,
+      chain,
+    });
+  }
   return {
     found: true,
     gid,
-    atVersion: ver.version,
+    atVersion: fromV,
+    toVersion: toV,
     members,
-    currentVersion: curVer ? curVer.version : null,
+    currentVersion,
+    retention,
   };
+}
+
+// 由某成员自身的 join/leave 事件回放其逐版归属（版本号自 1 起连续）
+function buildChain(memberEvents, currentVersion) {
+  const byVersion = new Map();
+  for (const e of memberEvents) {
+    const arr = byVersion.get(e.version);
+    if (arr) arr.push(e);
+    else byVersion.set(e.version, [e]);
+  }
+  const chain = [];
+  let gid = null;
+  for (let v = 1; v <= currentVersion; v++) {
+    const evs = byVersion.get(v) || [];
+    for (const e of evs) gid = e.op === 'join' ? e.gid : null;
+    chain.push({ version: v, gid });
+  }
+  return chain;
+}
+
+// 按成员归类两次发布之间的留存，每类按成员去重，明细定位到发布版与来源批次。
+// states：该成员 ≤ toV 的已发布来源版本状态事件（按 version 升序）。
+/**
+ * @param {string} k 成员键（source|id）
+ * @param {Array<{version: number, batch_id: string|null, seq: number|null, active: boolean}>} states
+ * @param {number} fromV 起始发布版
+ * @param {number} toV 期末发布版
+ * @param {RetentionReport} retention 归类结果（就地累积）
+ */
+function classifyMemberRetention(k, states, fromV, toV, retention) {
+  /** @type {{version: number, batch_id: string|null, seq: number|null, active: boolean}|null} */
+  let start = null;
+  for (const s of states) {
+    if (s.version <= fromV) start = s;
+  }
+  if (!start) {
+    retention.evidenceGaps.push({
+      key: k,
+      reason: `缺少 v${fromV} 或更早的已发布来源版本状态，旧数据不足`,
+    });
+    return;
+  }
+  if (!start.active) {
+    retention.evidenceGaps.push({
+      key: k,
+      reason: `v${fromV} 时该成员无有效来源版本，与馆藏成员身份矛盾，证据链不完整`,
+    });
+    return;
+  }
+  const startBatch = start.batch_id;
+  /** @type {RetentionSwitch[]} */
+  const switches = [];
+  /** @type {RetentionLapse[]} */
+  const lapses = [];
+  let lastActiveBatch = startBatch;
+  /** @type {RetentionLapse|null} */
+  let lapse = null;
+  let usedOtherBatch = false;
+  for (const s of states) {
+    if (s.version <= fromV || s.version > toV) continue;
+    if (!s.active) {
+      if (!lapse) {
+        lapse = { sinceVersion: s.version, untilVersion: null, lostBatchId: lastActiveBatch };
+      }
+      continue;
+    }
+    if (lapse) {
+      lapse.untilVersion = s.version;
+      lapses.push(lapse);
+      lapse = null;
+    }
+    if (s.batch_id !== lastActiveBatch) {
+      switches.push({
+        version: s.version,
+        fromBatchId: lastActiveBatch,
+        toBatchId: s.batch_id,
+        seq: s.seq,
+      });
+    }
+    if (s.batch_id !== startBatch) usedOtherBatch = true;
+    lastActiveBatch = s.batch_id;
+  }
+  if (lapse) lapses.push(lapse);
+  const end = states.length ? states[states.length - 1] : null;
+  if (end && end.active && end.batch_id !== null && end.seq !== null) {
+    retention.retained.push({ key: k, batchId: end.batch_id, seq: end.seq });
+  }
+  if (usedOtherBatch) retention.switchedBatch.push({ key: k, switches });
+  if (lapses.length) retention.lapsed.push({ key: k, lapses });
 }
 
 async function workloadLog(db) {

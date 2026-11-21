@@ -83,7 +83,13 @@ function createServer(deps) {
         const parts = p.split('/');
         const gid = decodeURIComponent(parts[3]);
         const at = url.searchParams.get('atVersion');
-        const out = await queries.traceGroup(db, gid, at ? parseInt(at, 10) : null);
+        const to = url.searchParams.get('toVersion');
+        const out = await queries.traceGroup(
+          db,
+          gid,
+          at ? parseInt(at, 10) : null,
+          to ? parseInt(to, 10) : null
+        );
         return out && out.found ? json(res, 200, out) : json(res, 404, { error: '馆藏不存在' });
       }
       if (req.method === 'GET' && p === '/audit/workload') {

@@ -8,7 +8,11 @@
  *       - 读取的来源记录数 source_records_read
  *       - 匹配比较数 comparisons
  *       - 新增历史馆藏数据量 new_group_rows
- *  期望：相同变更在两库上的工作量逐次相等，不随全库规模增长。
+ *     期望：相同变更在两库上的工作量逐次相等，不随全库规模增长。
+ *  3) 旧馆藏追查的规模无关性：在“5 个无关馆藏 + 5 次无变化发布”与各自扩容十倍的两个库上，
+ *     对同一馆藏执行同一追查，对比首次查询扫描的历史行数；
+ *     再执行同一笔单键更正发布，对比同批写入的追查载荷字节数（含辅助数据）。
+ *     期望：两项指标增幅均不超过两倍。
  */
 const fs = require('fs');
 const os = require('os');
@@ -112,6 +116,45 @@ function summarize(log) {
     comparisons: r.comparisons,
     newGroups: r.new_group_rows,
   }));
+}
+
+// ---------- 第三部分：旧馆藏追查的规模无关性 ----------
+// 统计一次追查扫描的历史行数、一次发布写入的追查载荷字节数（含参数等辅助数据）
+function instrument(db) {
+  const stats = { scannedRows: 0, payloadRows: 0, payloadBytes: 0 };
+  const all0 = db.all;
+  const run0 = db.run;
+  db.all = function (sql, params) {
+    return Promise.resolve(all0.call(db, sql, params)).then((rows) => {
+      stats.scannedRows += rows.length;
+      return rows;
+    });
+  };
+  db.run = function (sql, params) {
+    if (/insert into record_state_events/.test(sql)) {
+      stats.payloadRows += Math.floor((params || []).length / 5);
+      stats.payloadBytes +=
+        Buffer.byteLength(sql) + Buffer.byteLength(JSON.stringify(params || []));
+    }
+    return run0.call(db, sql, params);
+  };
+  return stats;
+}
+
+// 基准馆藏 + n 个彼此无关的馆藏（每个单独成版，即对被追查馆藏无变化的发布）
+async function buildTraceDb(file, noiseReleases) {
+  const db = openDatabase(file);
+  await initDatabase(db);
+  const mutex = new engine.Mutex();
+  await seedBaseline(db, mutex); // v1: G000001 = {A,B,C}
+  for (let i = 0; i < noiseReleases; i++) {
+    await engine.importBatch(db, mutex, {
+      batchId: `trace-noise-${i}`, source: 'registry',
+      records: [{ id: `TN${i}`, name: `无关登记陶器${i}`, mark: `杂款${i}`, height: 40 }],
+    });
+    await engine.publish(db, mutex, { reason: `无变化发布 ${i + 1}` });
+  }
+  return { db, mutex };
 }
 
 async function main() {
@@ -230,6 +273,56 @@ async function main() {
   }
 
   if (!invariantHolds) process.exit(1);
+
+  // ---------- 第三部分：旧馆藏追查的规模无关性 ----------
+  hr('第三部分：无关馆藏与无变化发布扩容十倍后的追查工作量');
+  const traceSmall = await buildTraceDb(path.join(dir, 'trace-small.duckdb'), 5);
+  const traceBig = await buildTraceDb(path.join(dir, 'trace-big.duckdb'), 50); // 各扩容十倍
+
+  // 首次查询扫描的历史行数：同一追查（起始版 v1 的三件同组 → 期末最新版）
+  const sStats = instrument(traceSmall.db);
+  const tSmall = await queries.traceGroup(traceSmall.db, 'G000001', 1, null);
+  const bStats = instrument(traceBig.db);
+  const tBig = await queries.traceGroup(traceBig.db, 'G000001', 1, null);
+  if (!tSmall || !tSmall.found || !tBig || !tBig.found) {
+    console.error('追查失败：未找到基准馆藏 G000001');
+    process.exit(1);
+  }
+  const rBig = tBig.retention;
+  console.log(
+    `\n追查 G000001（v1 → 期末）：小库 v${tSmall.toVersion} 扫描 ${sStats.scannedRows} 行，` +
+      `大库 v${tBig.toVersion} 扫描 ${bStats.scannedRows} 行`
+  );
+  console.log(
+    `  期末仍有效 ${rBig.retained.length} 人，` +
+      `期间改用其他批次 ${rBig.switchedBatch.length} 人，` +
+      `期间曾无有效版本 ${rBig.lapsed.length} 人，` +
+      `证据缺口 ${rBig.evidenceGaps.length} 人`
+  );
+  const scanRatio = bStats.scannedRows / Math.max(1, sStats.scannedRows);
+
+  // 同批写入的追查载荷：同一笔单键更正发布（仅 B 的有效来源批次变化）
+  for (const [side, stats] of [[traceSmall, sStats], [traceBig, bStats]]) {
+    await engine.correctRecord(side.db, side.mutex, {
+      batchId: 'trace-cB', source: 'repair', id: 'B', fields: { material: '炻器' },
+    });
+    stats.payloadRows = 0;
+    stats.payloadBytes = 0;
+    await engine.publish(side.db, side.mutex, { reason: '追查载荷测量' });
+  }
+  console.log(
+    `\n同一笔单键更正发布的追查载荷：小库 ${sStats.payloadRows} 行 / ${sStats.payloadBytes} 字节，` +
+      `大库 ${bStats.payloadRows} 行 / ${bStats.payloadBytes} 字节`
+  );
+  const payloadRatio = bStats.payloadBytes / Math.max(1, sStats.payloadBytes);
+
+  const traceHolds = scanRatio <= 2 && payloadRatio <= 2;
+  console.log(
+    traceHolds
+      ? `\n结论 ✓：扩容十倍后，扫描历史行数 ×${scanRatio.toFixed(2)}、追查载荷字节 ×${payloadRatio.toFixed(2)}，增幅均不超过两倍。`
+      : `\n结论 ✗：扫描行数 ×${scanRatio.toFixed(2)}、载荷字节 ×${payloadRatio.toFixed(2)}，增幅超过两倍。`
+  );
+  if (!traceHolds) process.exit(1);
 }
 
 main().catch((e) => {

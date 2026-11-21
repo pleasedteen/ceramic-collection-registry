@@ -164,7 +164,18 @@ create table if not exists evidence_events(
   evidence varchar not null,
   outcome varchar not null
 );
+-- 追查载荷：每次发布只记录“已发布有效来源版本”发生变化的记录键（有效/批次/序号），
+-- 使旧馆藏追查只读被追查成员自身的历史行，不随无关馆藏与无变化发布的规模增长
+create table if not exists record_state_events(
+  k varchar not null,
+  version integer not null,
+  batch_id varchar,
+  seq integer,
+  active boolean not null,
+  primary key(k, version)
+);
 create index if not exists idx_group_events_ver on group_events(version);
+create index if not exists idx_group_events_gid on group_events(gid);
 create index if not exists idx_membership_events_ver on membership_events(version);
 create index if not exists idx_membership_events_k on membership_events(k);
 create index if not exists idx_evidence_ver on evidence_events(version);

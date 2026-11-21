@@ -93,6 +93,24 @@ test('HTTP 全流程：导入→发布→判异→查询→审计→撤回', asy
     await c.post('/publications', {});
     groups = await c.get('/groups');
     assert.equal(groups.groups.length, 1);
+
+    // 留存追查：v1 → v5，B 在 v3 改用更正批次 cB、v5 撤回后回到 bB（同一成员只出现一次）
+    const retention = await c.get('/audit/groups/G000001?atVersion=1&toVersion=5');
+    assert.equal(retention.retention.fromVersion, 1);
+    assert.equal(retention.retention.toVersion, 5);
+    assert.equal(retention.retention.retained.length, 3);
+    assert.deepEqual(retention.retention.switchedBatch.map((m) => m.key), ['repair|B']);
+    assert.deepEqual(retention.retention.switchedBatch[0].switches, [
+      { version: 3, fromBatchId: 'bB', toBatchId: 'cB', seq: 2 },
+      { version: 5, fromBatchId: 'cB', toBatchId: 'bB', seq: 1 },
+    ]);
+    assert.deepEqual(retention.retention.lapsed, []);
+    assert.deepEqual(retention.retention.evidenceGaps, []);
+    // toVersion 早于 atVersion → 400
+    await assert.rejects(
+      () => c.get('/audit/groups/G000001?atVersion=3&toVersion=2'),
+      (e) => e.status === 400
+    );
   } finally {
     await new Promise((r) => server.close(r));
   }
