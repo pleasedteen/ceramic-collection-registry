@@ -96,6 +96,42 @@ test('固定基准：同组→判异拆分→更正→撤回更正→撤回判�
   assert.deepEqual([...gm.keys()], ['inventory|C,registry|A,repair|B']);
 });
 
+test('同编号馆藏仅更正材质：成员未变沿用编号，但历史版本快照必须反映新材质', async () => {
+  const { db, mutex } = await freshDb();
+  await seedBaseline(db, mutex); // v1：三条同组，材质瓷（出处 repair）
+  const before = (await queries.listGroups(db)).groups[0];
+
+  await engine.correctRecord(db, mutex, {
+    batchId: 'mat1', source: 'repair', id: 'B', fields: { material: '炻器' },
+  });
+  await engine.publish(db, mutex);
+
+  // 当前态材质已更新，成员与编号不变
+  const now = await queries.listGroups(db);
+  const cur = now.groups[0];
+  assert.equal(cur.gid, before.gid);
+  assert.deepEqual(cur.members, before.members);
+  assert.equal(cur.fields.material, '炻器');
+
+  // 历史版本快照：v1 仍为瓷，v2 为炻器（change 事件回放，而非停留在建组旧值）
+  const snap1 = await queries.buildVersionSnapshot(db, 1);
+  const snap2 = await queries.buildVersionSnapshot(db, 2);
+  assert.equal(snap1[0].fields.material, '瓷');
+  assert.equal(snap2[0].fields.material, '炻器');
+
+  const events = await db.all(
+    "select op from group_events where gid = ? and version = 2 order by event_id",
+    [before.gid]
+  );
+  assert.ok(events.some((e) => e.op === 'change'));
+
+  // 撤回更正后，v3 快照恢复瓷，且再次留下 change 事件
+  await engine.withdrawBatch(db, mutex, { batchId: 'mat1' });
+  await engine.publish(db, mutex);
+  const snap3 = await queries.buildVersionSnapshot(db, 3);
+  assert.equal(snap3[0].fields.material, '瓷');
+});
+
 test('整条更正只采用未撤回的最新版本', async () => {
   const { db, mutex } = await freshDb();
   await seedBaseline(db, mutex);

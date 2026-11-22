@@ -117,3 +117,60 @@ test('HTTP 健康检查与重复批次冲突', async () => {
     await new Promise((r) => server.close(r));
   }
 });
+
+test('HTTP 材质盘点：两版按材质（含未知）核对换入换出', async () => {
+  const { c, server } = await startServer();
+  try {
+    await c.post('/batches/imports', {
+      batchId: 'm1', source: 'registry',
+      records: [{ id: 'A', name: '青釉梅瓶', mark: '甲款', height: 20 }],
+    });
+    await c.post('/batches/imports', {
+      batchId: 'm2', source: 'repair',
+      records: [{ id: 'B', name: '青釉梅瓶', mark: '甲款', material: '瓷', height: 20 }],
+    });
+    await c.post('/batches/imports', {
+      batchId: 'm3', source: 'registry',
+      records: [{ id: 'N', name: '未知件', mark: '杂款', height: 9 }],
+    });
+    await c.post('/publications', {});
+    // B 由瓷改炻器（同编号改材质），N 补材质瓷（未知 → 瓷）
+    await c.post('/batches/corrections', {
+      batchId: 'mc1', source: 'repair', id: 'B', fields: { material: '炻器' },
+    });
+    await c.post('/batches/corrections', {
+      batchId: 'mc2', source: 'registry', id: 'N', fields: { material: '瓷' },
+    });
+    await c.post('/publications', {});
+
+    const recon = await c.get(
+      '/audit/material-recon?from=1&to=2&material=' + encodeURIComponent('瓷')
+    );
+    assert.equal(recon.unknown, false);
+    assert.deepEqual(recon.counts, { from: 1, to: 1, delta: 0 });
+    assert.equal(recon.joined.length, 1);
+    assert.equal(recon.joined[0].reason, 'material-changed');
+    assert.deepEqual(recon.joined[0].members, ['registry|N']);
+    assert.equal(recon.left.length, 1);
+    assert.equal(recon.left[0].reason, 'material-changed');
+    assert.deepEqual(recon.left[0].members, ['registry|A', 'repair|B']);
+    assert.equal(recon.checks.netDeltaConsistent, true);
+
+    const unknown = await c.get('/audit/material-recon?from=1&to=2&material=unknown');
+    assert.equal(unknown.unknown, true);
+    assert.equal(unknown.material, '未知');
+    assert.deepEqual(unknown.counts, { from: 1, to: 0, delta: -1 });
+
+    // 参数与版本错误返回结构化状态码
+    await assert.rejects(
+      () => c.get('/audit/material-recon?from=1&to=2'),
+      (e) => e.status === 400
+    );
+    await assert.rejects(
+      () => c.get('/audit/material-recon?from=1&to=99&material=瓷'),
+      (e) => e.status === 404
+    );
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});

@@ -756,6 +756,15 @@ async function doPublish(db, reason) {
   const leaveRows = [];
   const joinRows = [];
   const liveMemberRows = [];
+  // 旧版馆藏字段（用于检测成员未变但字段/出处变化，如同编号馆藏改材质）
+  const prevFieldRows = firstPublish
+    ? []
+    : await (async () => {
+        const gids = [...r.touchedOldGids];
+        if (!gids.length) return [];
+        return db.allIn('select * from live_groups', 'gid', gids);
+      })();
+  const prevFields = new Map(prevFieldRows.map((row) => [row.gid, row]));
   for (const g of r.resultGroups) {
     const isNew = !r.prevGid2Members.has(g.gid);
     liveGroupRows.push([
@@ -773,6 +782,40 @@ async function doPublish(db, reason) {
         JSON.stringify({ fields: g.fields, fieldSources: g.fieldSources }),
         JSON.stringify(g.members),
       ]);
+    } else {
+      // 成员未变、沿用编号的馆藏：字段或出处变化（典型为材质更正）也要留痕，
+      // 否则按版本回放会读到旧字段，无法核对“同编号改材质”。
+      const prev = prevFields.get(g.gid);
+      const changed =
+        !prev ||
+        prev.name !== g.fields.name ||
+        prev.name_src !== g.fieldSources.name ||
+        prev.mark !== g.fields.mark ||
+        prev.mark_src !== g.fieldSources.mark ||
+        prev.material !== g.fields.material ||
+        prev.material_src !== g.fieldSources.material ||
+        prev.height !== g.fields.height ||
+        prev.height_src !== g.fieldSources.height;
+      if (changed) {
+        groupEventRows.push([
+          version,
+          g.gid,
+          'change',
+          JSON.stringify({
+            fields: g.fields,
+            fieldSources: g.fieldSources,
+            previousFields: prev
+              ? {
+                  name: prev.name,
+                  mark: prev.mark,
+                  material: prev.material,
+                  height: prev.height,
+                }
+              : null,
+          }),
+          JSON.stringify(g.members),
+        ]);
+      }
     }
     const prevMembers = new Set(r.prevGid2Members.get(g.gid) || []);
     for (const k of g.members) {

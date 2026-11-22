@@ -8,7 +8,8 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test 'test/**/*.test.js'",
     "demo": "node scripts/demo.js",
-    "all": "npm run typecheck && npm test && npm run demo"
+    "inventory": "node scripts/material-inventory.js",
+    "all": "npm run typecheck && npm test && npm run demo && npm run inventory"
   },
   "keywords": [],
   "author": "",

@@ -144,6 +144,14 @@ async function buildVersionSnapshot(db, version) {
         fields: payload.fields || {},
         fieldSources: payload.fieldSources || {},
       });
+    } else if (e.op === 'change') {
+      // 成员未变、沿用编号的馆藏发生字段/出处变化（如同编号改材质）
+      const g = groups.get(e.gid);
+      if (g) {
+        const payload = e.fields ? JSON.parse(e.fields) : {};
+        if (payload.fields) g.fields = payload.fields;
+        if (payload.fieldSources) g.fieldSources = payload.fieldSources;
+      }
     } else if (e.op === 'close') {
       groups.delete(e.gid);
     }
@@ -289,4 +297,5 @@ module.exports = {
   workloadLog,
   lineageRows,
   latestVersion: latestVersionRow,
+  buildVersionSnapshot,
 };

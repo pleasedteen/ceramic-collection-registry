@@ -3,7 +3,7 @@ const http = require('http');
 const { URL } = require('url');
 const engine = require('./engine');
 const queries = require('./queries');
-const { parseKey } = require('./db');
+const { reconcileMaterial } = require('./material-recon');
 
 function json(res, status, payload) {
   const body = JSON.stringify(payload, null, 2);
@@ -88,6 +88,12 @@ function createServer(deps) {
       }
       if (req.method === 'GET' && p === '/audit/workload') {
         return json(res, 200, { log: await queries.workloadLog(db) });
+      }
+      if (req.method === 'GET' && p === '/audit/material-recon') {
+        const v1 = parseInt(url.searchParams.get('from') || '', 10);
+        const v2 = parseInt(url.searchParams.get('to') || '', 10);
+        const material = url.searchParams.get('material') || '';
+        return json(res, 200, await reconcileMaterial(db, v1, v2, material));
       }
       if (req.method === 'GET' && p === '/audit/lineage') {
         return json(res, 200, { groups: await queries.lineageRows(db) });

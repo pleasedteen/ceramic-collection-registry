@@ -25,8 +25,9 @@ npm run all
 ```
 
 - `npm run typecheck`：TypeScript 对 `src/`、`scripts/` 做严格空值检查（不产出文件）。
-- `npm test`：Node 内置 test runner，15 个用例（规范化、固定基准、撤回、审计、崩溃回滚、HTTP 端到端）。
+- `npm test`：Node 内置 test runner，25 个用例（规范化、固定基准、撤回、审计、崩溃回滚、HTTP 端到端、两版材质盘点）。
 - `npm run demo`：重放固定基准，并在加入 5 万条无关记录前后执行同一串 20 次小批变更，输出可核对归组与三项工作量。
+- `npm run inventory`：馆员材质盘点核对——任选两个发布版按材质（含未知）对比馆藏件数、逐条列出归入/离开该类的馆藏编号与当版成员；再在干净库与含 5 万无关馆藏的大库上执行同一串小批发布，核对读取历史量不增长、历史只写给受影响馆藏。
 
 ## 数据模型
 
@@ -35,7 +36,7 @@ npm run all
 - `batches`：所有导入/更正/判异/撤回批次及撤回状态，馆员可撤回任一导入批次或异件判定，其余有效提交继续参与。
 - `block_name` / `block_mark`：按规范化品名、刻款维护的分块索引，支撑增量发布按索引定位候选而不扫描全库。
 - `live_groups` / `live_members`：最新**完整发布**的物化当前态，所有查询只读到这里，未发布的工作区变更不可见。
-- `group_events` / `membership_events` / `evidence_events`：只追加的历史事件，支持按版本回放、审计合并/拆分依据、旧馆藏逐条追查。
+- `group_events` / `membership_events` / `evidence_events`：只追加的历史事件，支持按版本回放、审计合并/拆分依据、旧馆藏逐条追查。成员未变但字段（含材质）变化时追加 `op='change'`，保证按版回放读到当版实际字段。
 - `publications` / `recompute_log`：发布版本元数据与每次发布的工作量（读取来源记录数、匹配比较数、新增历史馆藏行数）。
 - `group_lineage`：每个馆藏编号的诞生/关闭版本；成员未变的馆藏沿用原编号。
 
@@ -118,6 +119,7 @@ npm run all
 | GET | `/versions/:v` | 任一版的馆藏、字段出处、合并/拆分依据、剪开边 |
 | GET | `/audit/groups/:gid?atVersion=:v` | 旧馆藏逐条成员的当前归属/撤回状态与跨版本归属链 |
 | GET | `/audit/workload` | 每次发布的三项工作量 |
+| GET | `/audit/material-recon?from=:v1&to=:v2&material=:m` | 两版之间按材质（含未知）盘点馆藏件数与换入换出 |
 | GET | `/audit/lineage` | 馆藏编号诞生/关闭版本 |
 | GET | `/health` | 健康检查与当前版本号 |
 
@@ -137,6 +139,21 @@ npm run all
   ]
 }
 ```
+
+## 两版材质盘点（含未知材质）
+
+`GET /audit/material-recon?from=v1&to=v2&material=瓷`（未知类用 `material=unknown`）以两个完整发布版的**实际物化归类**为准做核对，不依赖工作区：
+
+- `counts`：两版该材质类的馆藏件数与净差。空材质（`null`/空串/字符串 `null`）统一归入未知类。
+- `joined` / `left`：归入、离开该类的馆藏，每条含馆藏编号、当版材质与字段出处、**当版成员键列表**，以及成员逐条的旧/新类内归属（`previousMembership` / `nextMembership`），可直接核对换入换出。
+- 归类原因 `reason`：
+  - `material-changed`：成员集合完全相同的同编号馆藏改了材质（同编号改材质同样记账，双向列出）；
+  - `regroup`：拆分/合并导致的换入换出（成员来自或去往该类内其他馆藏）；
+  - `new`：该版新出现的馆藏；`moved-out`：整体进入类外馆藏；`withdrawn`：记录撤回导致馆藏消失。
+- `sameGidMaterialChanged`：同编号馆藏材质变化的专门台账（旧材质 → 新材质）。
+- `checks`：自洽校验——件数净差 = 归入数 − 离开数，并额外按来源记录成员口径复核（成员净差 = 换入成员 − 换出成员）。**净差为零时归入/离开明细仍逐条保留**，换入换出可核对。
+
+成员未变的馆藏沿用原编号；其字段（含材质）发生变化时，发布会追加一条 `group_events(op='change')` 事件，按版本回放（`/versions/:v` 与本盘点）读到的都是当版实际材质，而不是建组时的旧值。
 
 ## 增量与规模无关性
 
