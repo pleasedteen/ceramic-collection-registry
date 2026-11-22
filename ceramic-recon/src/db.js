@@ -19,6 +19,53 @@ function openDatabase(file) {
     fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
   }
   const raw = new duckdb.Database(file);
+  const api = buildApi(raw, file);
+  api.raw = raw;
+  /**
+   * 在一个**独立的只读连接 + 事务**里执行 fn。
+   *
+   * 写操作（导入/更正/撤回/发布）都跑在默认连接的事务里；如果查询也读默认连接，
+   * 就会在发布事务提交前看到 delete 后 insert 前的中间态（列表变空），也会在
+   * 一个响应的多次查询之间跨过提交而混用新旧两版。新连接在 BEGIN 时拿到一个
+   * 固定的已提交快照：发布进行中仍能读完旧版，查询跨过提交也不会混版。
+   *
+   * `:memory:` 数据库的新连接是另一份空库，无法这样隔离，只能退化到默认连接。
+   */
+  api.withReadSnapshot = async (fn) => {
+    if (file === ':memory:') return fn(api);
+    const conn = raw.connect();
+    const runner = buildApi(conn, file);
+    try {
+      await runner.run('BEGIN TRANSACTION');
+      let out;
+      try {
+        out = await fn(runner);
+      } catch (e) {
+        try {
+          await runner.run('ROLLBACK');
+        } catch {
+          /* ignore */
+        }
+        throw e;
+      }
+      await runner.run('COMMIT');
+      return out;
+    } finally {
+      await new Promise((resolve) => {
+        try {
+          conn.close(() => resolve(undefined));
+        } catch {
+          resolve(undefined);
+        }
+      });
+    }
+  };
+  return api;
+}
+
+// 同一套查询/写入接口：既可包一个 Database（默认连接，写操作用），
+// 也可包一个 Connection（只读快照用），行为一致。
+function buildApi(target, file) {
   const convert = (row) => {
     if (!row || typeof row !== 'object') return row;
     for (const k of Object.keys(row)) {
@@ -27,21 +74,20 @@ function openDatabase(file) {
     return row;
   };
   const api = {
-    raw,
     file,
     all(sql, params = []) {
       return new Promise((resolve, reject) => {
         const cb = (err, rows) =>
           err ? reject(err) : resolve(rows.map((r) => convert(r)));
-        if (params.length === 0) raw.all(sql, cb);
-        else raw.all(sql, ...params, cb);
+        if (params.length === 0) target.all(sql, cb);
+        else target.all(sql, ...params, cb);
       });
     },
     run(sql, params = []) {
       return new Promise((resolve, reject) => {
         const cb = (err) => (err ? reject(err) : resolve(undefined));
-        if (params.length === 0) raw.run(sql, cb);
-        else raw.run(sql, ...params, cb);
+        if (params.length === 0) target.run(sql, cb);
+        else target.run(sql, ...params, cb);
       });
     },
     // 分块执行 "where <col> in (...)"，避免超大参数展开导致栈溢出
@@ -82,8 +128,12 @@ create table if not exists record_versions(
   name varchar, mark varchar, material varchar,
   height double,
   withdrawn_at bigint,
+  -- 该版本首次随一次完整发布对外可见的版本号；未发布的导入/更正恒为 null，
+  -- 因此“是否已发布”只认这个标记，不看 batch 或 created_at 时间戳。
+  published_version integer,
   unique(source, source_id, seq)
 );
+alter table record_versions add column if not exists published_version integer;
 create table if not exists heterology_edges(
   batch_id varchar primary key,
   k1 varchar not null,
@@ -137,6 +187,15 @@ create table if not exists live_groups(
 create table if not exists live_members(
   k varchar primary key,
   gid varchar not null
+);
+-- 已发布记录的当前字段快照：查询来源明细只读这里，绝不读工作区 v_active_records，
+-- 因此未发布的更正/撤回不会提前出现。rv_id 指向该发布实际采用的版本。
+create table if not exists live_records(
+  k varchar primary key,
+  source varchar not null,
+  source_id varchar not null,
+  rv_id bigint not null,
+  name varchar, mark varchar, material varchar, height double
 );
 
 -- ===== 只追加的历史事件（审计与按版本重建依据）=====

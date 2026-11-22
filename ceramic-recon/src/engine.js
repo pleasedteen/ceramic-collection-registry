@@ -21,6 +21,14 @@ function setCrashBeforeCommit(v) {
   crashBeforeCommit = !!v;
 }
 
+// 发布暂停钩子（测试/诊断用）：在发布事务写入完成、提交之前 await 它。
+// 期间工作区事务保持打开，查询可用独立只读快照读完整旧版。
+/** @type {null | (() => Promise<void>)} */
+let beforeCommitHook = null;
+function setBeforeCommitHook(fn) {
+  beforeCommitHook = fn || null;
+}
+
 class Mutex {
   constructor() {
     this.chain = Promise.resolve();
@@ -660,7 +668,11 @@ async function recompute(db, affectedHint, firstPublish) {
   let firstSeq = 0;
   let seqCursor = 0;
   if (needNew > 0) {
-    const row = await db.all(`select nextval('gid_seq') as v from range(${needNew})`);
+    // 编号从 group_lineage 现有最大值继续，而不是从非事务序列取号：
+    // 发布在提交前中断时 lineage 插入整体回滚，重试得到的编号与一次成功发布相同。
+    const row = await db.all(
+      `select coalesce(max(cast(substr(gid, 2) as integer)), 0) + 1 as v from group_lineage`
+    );
     firstSeq = Number(row[0].v);
   }
   let newGroupRows = 0;
@@ -756,6 +768,8 @@ async function doPublish(db, reason) {
   const leaveRows = [];
   const joinRows = [];
   const liveMemberRows = [];
+  const liveRecordRows = [];
+  const affectedSet = new Set(r.metrics.affectedKeys);
   for (const g of r.resultGroups) {
     const isNew = !r.prevGid2Members.has(g.gid);
     liveGroupRows.push([
@@ -773,6 +787,15 @@ async function doPublish(db, reason) {
         JSON.stringify({ fields: g.fields, fieldSources: g.fieldSources }),
         JSON.stringify(g.members),
       ]);
+    } else {
+      // 沿用编号的馆藏也要留痕本版字段，否则按版本回放会读到旧字段
+      groupEventRows.push([
+        version,
+        g.gid,
+        'change',
+        JSON.stringify({ fields: g.fields, fieldSources: g.fieldSources }),
+        null,
+      ]);
     }
     const prevMembers = new Set(r.prevGid2Members.get(g.gid) || []);
     for (const k of g.members) {
@@ -789,17 +812,39 @@ async function doPublish(db, reason) {
     }
   }
 
+  // 已发布来源记录的字段快照：只覆盖本版重算过的键；无关记录原样保留。
+  // 查询来源明细只读这里，未发布的工作区更正/撤回不可见。
+  for (const k of affectedSet) {
+    const rec = r.recMap.get(k);
+    if (!rec) continue; // 已撤回：下面删除其快照行
+    liveRecordRows.push([
+      k,
+      rec.source, rec.source_id, rec.rv_id,
+      rec.name, rec.mark, rec.material, rec.height,
+    ]);
+  }
+
   // 仅替换受影响旧馆藏的当前态；无关馆藏的 live 行完全不触碰（规模无关）
   const affectedOldGids = [...r.touchedOldGids];
   if (firstPublish) {
     await db.run('delete from live_groups');
     await db.run('delete from live_members');
-  } else if (affectedOldGids.length) {
-    for (let s = 0; s < affectedOldGids.length; s += 500) {
-      const part = affectedOldGids.slice(s, s + 500);
+    await db.run('delete from live_records');
+  } else {
+    if (affectedOldGids.length) {
+      for (let s = 0; s < affectedOldGids.length; s += 500) {
+        const part = affectedOldGids.slice(s, s + 500);
+        const ph = part.map(() => '?').join(',');
+        await db.run(`delete from live_groups where gid in (${ph})`, part);
+        await db.run(`delete from live_members where gid in (${ph})`, part);
+      }
+    }
+    // 重算键的快照重写：先删后插（含撤回产生的删除）
+    const affectedKeys = [...affectedSet];
+    for (let s = 0; s < affectedKeys.length; s += 500) {
+      const part = affectedKeys.slice(s, s + 500);
       const ph = part.map(() => '?').join(',');
-      await db.run(`delete from live_groups where gid in (${ph})`, part);
-      await db.run(`delete from live_members where gid in (${ph})`, part);
+      await db.run(`delete from live_records where k in (${ph})`, part);
     }
   }
   const keepCount = firstPublish
@@ -810,6 +855,23 @@ async function doPublish(db, reason) {
     ['gid', 'name', 'name_src', 'mark', 'mark_src', 'material', 'material_src', 'height', 'height_src'],
     liveGroupRows, '(?, ?, ?, ?, ?, ?, ?, ?, ?)');
   await insertChunked(db, 'live_members', ['k', 'gid'], liveMemberRows, '(?, ?)');
+  await insertChunked(db, 'live_records',
+    ['k', 'source', 'source_id', 'rv_id', 'name', 'mark', 'material', 'height'],
+    liveRecordRows, '(?, ?, ?, ?, ?, ?, ?, ?)');
+
+  // 本次发布实际采用的记录版本打上发布标记：是否已发布只认这个标记，
+  // 不看批次、时间戳或 created_at，即使批次/时间相同也不会混淆。
+  {
+    const rvIds = liveRecordRows.map((row) => row[3]);
+    for (let s = 0; s < rvIds.length; s += 500) {
+      const part = rvIds.slice(s, s + 500);
+      const ph = part.map(() => '?').join(',');
+      await db.run(
+        `update record_versions set published_version = ? where rv_id in (${ph}) and published_version is null`,
+        [version, ...part]
+      );
+    }
+  }
 
   await insertChunked(db, 'group_events', ['version', 'gid', 'op', 'fields', 'members'], groupEventRows, '(?, ?, ?, ?, ?)');
   await insertChunked(db, 'membership_events', ['version', 'k', 'gid', 'op'], leaveRows, '(?, ?, ?, ?)');
@@ -855,6 +917,9 @@ async function doPublish(db, reason) {
   );
   await db.run('delete from outbox');
 
+  if (beforeCommitHook) {
+    await beforeCommitHook();
+  }
   if (crashBeforeCommit) {
     throw new Error('CRASH_BEFORE_COMMIT test hook');
   }
@@ -886,6 +951,7 @@ module.exports = {
   withdrawBatch,
   publish,
   setCrashBeforeCommit,
+  setBeforeCommitHook,
   FIELD_PRIORITY,
   FIELDS,
 };

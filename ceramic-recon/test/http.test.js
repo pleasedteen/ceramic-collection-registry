@@ -18,7 +18,7 @@ async function startServer() {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
   const c = client(`http://127.0.0.1:${port}`);
-  return { c, server, dir };
+  return { c, server, db, mutex, dir };
 }
 
 test('HTTP 全流程：导入→发布→判异→查询→审计→撤回', async () => {
@@ -113,6 +113,62 @@ test('HTTP 健康检查与重复批次冲突', async () => {
         }),
       (e) => e.status === 409
     );
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('HTTP 发布暂停期间查询读到同一份完整旧版，提交后才切换', async () => {
+  const { c, server } = await startServer();
+  try {
+    await c.post('/batches/imports', {
+      batchId: 'bA', source: 'registry',
+      records: [{ id: 'A', name: '甲瓶', mark: 'x', height: 20 }],
+    });
+    await c.post('/batches/imports', {
+      batchId: 'bB', source: 'repair',
+      records: [{ id: 'B', name: '甲缾', mark: 'x', height: 20 }],
+    });
+    await c.post('/publications', {});
+    const gid = (await c.get('/groups')).groups[0].gid;
+
+    // 未发布更正：来源明细不应提前显示
+    await c.post('/batches/corrections', {
+      batchId: 'cA', source: 'registry', id: 'A', fields: { name: '未发布丙瓶' },
+    });
+    let rec = await c.get('/records/registry|A');
+    assert.equal(rec.record.name, '甲瓶');
+
+    // 发布事务写入后、提交前暂停：所有查询共享同一完整旧版，不出现空列表
+    let seen = null;
+    engine.setBeforeCommitHook(async () => {
+      const [groups, one, records, health] = await Promise.all([
+        c.get('/groups'),
+        c.get(`/groups/${gid}`),
+        c.get('/records/registry|A'),
+        c.get('/health'),
+      ]);
+      seen = { groups, one, records, health };
+    });
+    try {
+      await c.post('/publications', {});
+    } finally {
+      engine.setBeforeCommitHook(null);
+    }
+    assert.ok(seen);
+    assert.equal(seen.groups.version, 1);
+    assert.equal(seen.groups.groups.length, 1);
+    assert.equal(seen.one.group.members.length, 2);
+    assert.equal(seen.records.record.name, '甲瓶');
+    assert.equal(seen.health.currentVersion, 1);
+
+    // 提交后统一切到新版
+    rec = await c.get('/records/registry|A');
+    assert.equal(rec.record.name, '未发布丙瓶');
+    assert.equal((await c.get('/groups')).version, 2);
+    // 旧馆藏追查仍可读
+    const trace = await c.get(`/audit/groups/${gid}?atVersion=1`);
+    assert.equal(trace.members.length, 2);
   } finally {
     await new Promise((r) => server.close(r));
   }

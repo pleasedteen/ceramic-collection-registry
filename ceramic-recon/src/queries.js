@@ -1,6 +1,14 @@
 'use strict';
 const { keyOf, parseKey, SOURCE_LABEL } = require('./db');
 
+// 所有对外查询都在一个独立的只读快照事务里完成：
+//   - 发布进行中（工作区事务未提交）仍读得到完整旧版，不会看到“列表变空”的中间态；
+//   - 同一响应的多次查询共享同一快照，即使期间有新发布提交也不会新旧混版。
+function withSnapshot(db, fn) {
+  if (db.withReadSnapshot) return db.withReadSnapshot((s) => fn(s));
+  return fn(db);
+}
+
 async function latestVersionRow(db) {
   const rows = await db.all('select * from publications order by version desc limit 1');
   return rows[0] || null;
@@ -12,10 +20,12 @@ async function getVersionRow(db, version) {
 }
 
 async function listVersions(db) {
-  const rows = await db.all(
-    'select version, created_at, reason, stats from publications order by version'
-  );
-  return rows.map((r) => ({ ...r, stats: JSON.parse(r.stats) }));
+  return withSnapshot(db, async (s) => {
+    const rows = await s.all(
+      'select version, created_at, reason, stats from publications order by version'
+    );
+    return rows.map((r) => ({ ...r, stats: JSON.parse(r.stats) }));
+  });
 }
 
 function shapeGroup(row) {
@@ -36,8 +46,23 @@ function shapeGroup(row) {
   };
 }
 
+function shapeRecord(row) {
+  return {
+    source: row.source,
+    id: row.source_id,
+    name: row.name,
+    mark: row.mark,
+    material: row.material,
+    height: row.height,
+  };
+}
+
 // 当前馆藏（最新完整发布）
 async function listGroups(db) {
+  return withSnapshot(db, (s) => listGroupsIn(s));
+}
+
+async function listGroupsIn(db) {
   const ver = await latestVersionRow(db);
   if (!ver) return { published: false, groups: [] };
   const groupRows = await db.all('select * from live_groups order by gid');
@@ -55,14 +80,22 @@ async function listGroups(db) {
 }
 
 async function getGroup(db, gid) {
+  return withSnapshot(db, (s) => getGroupIn(s, gid));
+}
+
+async function getGroupIn(db, gid) {
   const ver = await latestVersionRow(db);
   if (!ver) return null;
   const rows = await db.all('select * from live_groups where gid = ?', [gid]);
   if (!rows.length) return null;
   const members = await db.all('select k from live_members where gid = ? order by k', [gid]);
   const evidence = await db.all(
-    'select k1, k2, confidence, evidence, outcome from evidence_events where version = ? and (k1 in (select k from live_members where gid = ?)) order by k1, k2',
-    [ver.version, gid]
+    `select k1, k2, confidence, evidence, outcome from evidence_events
+     where version = ?
+       and k1 in (select k from live_members where gid = ?)
+       and k2 in (select k from live_members where gid = ?)
+     order by k1, k2`,
+    [ver.version, gid, gid]
   );
   return {
     version: ver.version,
@@ -74,53 +107,73 @@ async function getGroup(db, gid) {
   };
 }
 
+// 单条记录当前归属：字段只取已发布的 live_records 快照，
+// 绝不读工作区 v_active_records，所以未发布的更正/撤回不会提前显示。
 async function getRecord(db, source, id) {
+  return withSnapshot(db, (s) => getRecordIn(s, source, id));
+}
+
+async function getRecordIn(db, source, id) {
   const ver = await latestVersionRow(db);
   if (!ver) return { published: false };
   const k = keyOf(source, id);
-  const live = await db.all('select gid from live_members where k = ?', [k]);
-  if (!live.length) {
+  const recRows = await db.all('select * from live_records where k = ?', [k]);
+  if (!recRows.length) {
+    // 未在最新发布中出现：区分“已发布后撤回”与“尚未发布（工作区新建或改动）”
     const hist = await db.all(
-      'select rv_id, seq, batch_id, withdrawn_at from record_versions where source = ? and source_id = ? order by seq',
+      `select rv_id, seq, batch_id, withdrawn_at, published_version
+       from record_versions where source = ? and source_id = ? order by seq`,
       [source, id]
     );
-    if (!hist.length) return { published: true, found: false };
-    return { published: true, found: false, status: 'withdrawn', history: hist };
+    if (!hist.length) return { published: true, version: ver.version, found: false };
+    const everPublished = hist.some((h) => h.published_version !== null);
+    if (!everPublished) {
+      return {
+        published: true,
+        version: ver.version,
+        found: false,
+        status: 'unpublished',
+        history: hist,
+      };
+    }
+    const withdrawn = hist.some((h) => h.withdrawn_at !== null);
+    return {
+      published: true,
+      version: ver.version,
+      found: false,
+      status: withdrawn ? 'withdrawn' : 'absent',
+      history: hist,
+    };
   }
-  const gid = live[0].gid;
-  const gRow = await db.all('select * from live_groups where gid = ?', [gid]);
-  const members = await db.all('select k from live_members where gid = ? order by k', [gid]);
-  const recRows = await db.all(
-    'select * from v_active_records where source = ? and source_id = ?',
-    [source, id]
-  );
-  const evidence = await db.all(
-    'select k1, k2, confidence, evidence, outcome from evidence_events where version = ? order by k1, k2',
-    [ver.version]
-  );
-  const rec = recRows[0] || {};
+  const rec = recRows[0];
+  const live = await db.all('select gid from live_members where k = ?', [k]);
+  const gid = live.length ? live[0].gid : null;
+  const gRow = gid ? await db.all('select * from live_groups where gid = ?', [gid]) : [];
+  const members = gid
+    ? await db.all('select k from live_members where gid = ? order by k', [gid])
+    : [];
+  const evidence = gid
+    ? await db.all(
+        `select k1, k2, confidence, evidence, outcome from evidence_events
+         where version = ?
+           and k1 in (select k from live_members where gid = ?)
+           and k2 in (select k from live_members where gid = ?)
+         order by k1, k2`,
+        [ver.version, gid, gid]
+      )
+    : [];
   return {
     published: true,
+    version: ver.version,
     found: true,
-    record: {
-      source,
-      id,
-      name: rec.name,
-      mark: rec.mark,
-      material: rec.material,
-      height: rec.height,
-      gid,
-    },
-    group: {
-      ...shapeGroup(gRow[0]),
-      members: members.map((m) => m.k),
-      matchEvidence: evidence
-        .filter((e) => {
-          const ks = members.map((m) => m.k);
-          return ks.includes(e.k1) && ks.includes(e.k2);
-        })
-        .map((e) => ({ ...e, evidence: JSON.parse(e.evidence) })),
-    },
+    record: { ...shapeRecord(rec), gid },
+    group: gRow.length
+      ? {
+          ...shapeGroup(gRow[0]),
+          members: members.map((m) => m.k),
+          matchEvidence: evidence.map((e) => ({ ...e, evidence: JSON.parse(e.evidence) })),
+        }
+      : null,
   };
 }
 
@@ -144,6 +197,13 @@ async function buildVersionSnapshot(db, version) {
         fields: payload.fields || {},
         fieldSources: payload.fieldSources || {},
       });
+    } else if (e.op === 'change') {
+      const payload = e.fields ? JSON.parse(e.fields) : {};
+      const g = groups.get(e.gid);
+      if (g) {
+        g.fields = payload.fields || g.fields;
+        g.fieldSources = payload.fieldSources || g.fieldSources;
+      }
     } else if (e.op === 'close') {
       groups.delete(e.gid);
     }
@@ -176,10 +236,20 @@ async function buildVersionSnapshot(db, version) {
 
 // 版本详情：馆藏、字段出处、合并/拆分依据
 async function versionDetail(db, version) {
+  return withSnapshot(db, (s) => versionDetailIn(s, version));
+}
+
+async function versionDetailIn(db, version) {
   const row = await getVersionRow(db, version);
   if (!row) return null;
+  // 上一版取“真实存在的最大更小版本”，不假设版本号连续
+  const prevRows = await db.all(
+    'select max(version) v from publications where version < ?',
+    [version]
+  );
+  const prevVersion = prevRows[0] && prevRows[0].v != null ? Number(prevRows[0].v) : null;
   const groups = await buildVersionSnapshot(db, version);
-  const prevGroups = version > 1 ? await buildVersionSnapshot(db, version - 1) : [];
+  const prevGroups = prevVersion ? await buildVersionSnapshot(db, prevVersion) : [];
   const enriched = groups.map((g) => {
     const memberSet = new Set(g.members);
     const hits = prevGroups
@@ -221,6 +291,10 @@ async function versionDetail(db, version) {
 
 // 旧馆藏追查：逐条成员 → 当前归属或已撤回，及其跨版本归属链
 async function traceGroup(db, gid, atVersion) {
+  return withSnapshot(db, (s) => traceGroupIn(s, gid, atVersion));
+}
+
+async function traceGroupIn(db, gid, atVersion) {
   const ver = atVersion
     ? await getVersionRow(db, atVersion)
     : await latestVersionRow(db);
@@ -230,6 +304,11 @@ async function traceGroup(db, gid, atVersion) {
   if (!g) return { found: false, gid };
   const curVer = await latestVersionRow(db);
   const allVersions = await db.all('select version from publications order by version');
+  // 目标版本快照只依赖 <= 目标版本的事件；逐版回放也各自是独立快照
+  const snapshots = new Map();
+  for (const v of allVersions) {
+    snapshots.set(v.version, await buildVersionSnapshot(db, v.version));
+  }
   const members = await Promise.all(
     g.members.map(async (k) => {
       const { source, id } = parseKey(k);
@@ -238,16 +317,22 @@ async function traceGroup(db, gid, atVersion) {
       if (curLive.length) {
         status = { state: 'active', gid: curLive[0].gid };
       } else {
-        const withdrawn = await db.all(
-          'select 1 from record_versions where source = ? and source_id = ? and withdrawn_at is not null limit 1',
+        const hist = await db.all(
+          `select withdrawn_at, published_version from record_versions
+           where source = ? and source_id = ? order by seq desc`,
           [source, id]
         );
-        status = { state: withdrawn.length ? 'withdrawn' : 'absent' };
+        const everPublished = hist.some((h) => h.published_version !== null);
+        const withdrawn = hist.some((h) => h.withdrawn_at !== null);
+        let state = 'absent';
+        if (!everPublished) state = 'unpublished';
+        else if (withdrawn) state = 'withdrawn';
+        status = { state };
       }
-      // 归属链：逐版回放该成员所在 gid
+      // 归属链：逐版回放该成员所在 gid（用已算好的快照，避免混版）
       const chain = [];
       for (const v of allVersions) {
-        const snap = await buildVersionSnapshot(db, v.version);
+        const snap = snapshots.get(v.version);
         const hit = snap.find((sg) => sg.members.includes(k));
         chain.push({ version: v.version, gid: hit ? hit.gid : null });
       }
@@ -271,12 +356,14 @@ async function traceGroup(db, gid, atVersion) {
 }
 
 async function workloadLog(db) {
-  const rows = await db.all('select * from recompute_log order by version');
-  return rows.map((r) => ({ ...r, touched_keys: JSON.parse(r.touched_keys) }));
+  return withSnapshot(db, async (s) => {
+    const rows = await s.all('select * from recompute_log order by version');
+    return rows.map((r) => ({ ...r, touched_keys: JSON.parse(r.touched_keys) }));
+  });
 }
 
 async function lineageRows(db) {
-  return db.all('select * from group_lineage order by gid');
+  return withSnapshot(db, (s) => s.all('select * from group_lineage order by gid'));
 }
 
 module.exports = {
@@ -288,5 +375,6 @@ module.exports = {
   traceGroup,
   workloadLog,
   lineageRows,
-  latestVersion: latestVersionRow,
+  // 健康检查也走只读快照：发布事务进行中不会读到未提交的版本号
+  latestVersion: (db) => withSnapshot(db, (s) => latestVersionRow(s)),
 };
