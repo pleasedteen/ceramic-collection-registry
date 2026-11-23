@@ -25,8 +25,8 @@ npm run all
 ```
 
 - `npm run typecheck`：TypeScript 对 `src/`、`scripts/` 做严格空值检查（不产出文件）。
-- `npm test`：Node 内置 test runner，15 个用例（规范化、固定基准、撤回、审计、崩溃回滚、HTTP 端到端）。
-- `npm run demo`：重放固定基准，并在加入 5 万条无关记录前后执行同一串 20 次小批变更，输出可核对归组与三项工作量。
+- `npm test`：Node 内置 test runner，25 个用例（规范化、固定基准、撤回、审计、合并/拆分统计、逐边裁决、旧库升级、崩溃回滚、HTTP 端到端）。
+- `npm run demo`：重放固定基准，并在加入 5 万条无关记录前后执行同一串 20 次小批变更，输出可核对归组与四项工作量（含审计增量）。
 
 ## 数据模型
 
@@ -115,9 +115,9 @@ npm run all
 | GET | `/groups/:gid` | 单个馆藏及匹配证据 |
 | GET | `/records/:source\|:id` | 单条记录当前归属；已撤回返回 `status=withdrawn` |
 | GET | `/versions` | 发布版本列表与工作量 |
-| GET | `/versions/:v` | 任一版的馆藏、字段出处、合并/拆分依据、剪开边 |
+| GET | `/versions/:v` | 任一版的馆藏、字段出处、合并/拆分统计、逐边裁决（见下） |
 | GET | `/audit/groups/:gid?atVersion=:v` | 旧馆藏逐条成员的当前归属/撤回状态与跨版本归属链 |
-| GET | `/audit/workload` | 每次发布的三项工作量 |
+| GET | `/audit/workload` | 每次发布的四项工作量（含审计行数） |
 | GET | `/audit/lineage` | 馆藏编号诞生/关闭版本 |
 | GET | `/health` | 健康检查与当前版本号 |
 
@@ -138,6 +138,25 @@ npm run all
 }
 ```
 
+### `/versions/:v` 核对本次发布
+
+馆员用 `/versions/:v` 核对第 `v` 版（相对第 `v-1` 版）的合并与拆分数量。所有依据都由**只追加事件**（`group_events` / `membership_events` / `evidence_events` / `heterology_events`）回放，撤回判异或在同一数据库重开局后仍可复核旧版本。
+
+- **合并/拆分按成员去向统计**（`mergeSplit`）：
+  - **合并**：某新馆藏的成员来自 ≥2 个旧馆藏；
+  - **拆分**：某旧馆藏的幸存成员流向 ≥2 个新馆藏；
+  - **扩员**（整组吸收全新记录）或**仅撤回成员**（幸存者仍聚在一起）都**不算拆分**；
+  - 交叉重组（旧馆藏被拆到多处，新馆藏又由多处汇入）**可同时计入两类**。
+  - 每个馆藏另带 `lineageBasis.kind`：`new` / `unchanged` / `expanded` / `contracted` / `changed` / `merge` / `split` / `merge+split`。
+- **明细可独立复算**：`groups[].lineageBasis.predecessors`（来自哪些旧馆藏、共享哪些成员）、`mergeSplit.merges[].contributors`、`mergeSplit.splits[].destinations` 与 `affectedKeys` 列出全部依据键；`edgeOrder` 给出每条匹配边的处理次序与裁决，按其 `seq` 逐边做并查集（`connected` 合并、`redundant`/`cut` 不合并）即可独立重现归组。
+- **逐边裁决**（`edges`）区分：
+  - `connected`：实际连通（该边第一次把两个组件合并）；
+  - `redundant`：冗余匹配（两端此前已同组，成环，不改变归组）；
+  - `cut`：被异件判定拦下，带 `blockedByBatch`（哪个判异批次拦下）、`blockedPair`（会冲突的异件对）与 `reason`。
+  - `heterology` 为当版有效异件判定快照（`k1/k2/batch_id`）。
+- **旧库缺失标注**：升级前的版本在库中没有逐边区分与判异快照，`audit.missing` 会逐项列出无法可靠还原的依据（如 `edgeDisposition`、`heterologyBasis`），绝不臆造；旧证据归入 `edges.unknown` 并保留原始 `legacyOutcome`。升级后新发布的版本 `audit.complete=true`。
+- **规模无关**：审计增量（`recompute_log.audit_rows`）只覆盖受影响子图，加入无关馆藏后同一小批变更的审计行数保持逐次不变。
+
 ## 增量与规模无关性
 
 每次发布只重算受影响子图：
@@ -147,7 +166,7 @@ npm run all
 3. 经分块索引取出共享品名/刻款的候选（无关分块完全不读）；
 4. 只在受影响子图内比较、分区；无关馆藏的 `live_*` 行原样保留。
 
-因此小批变更的**读取来源记录数、匹配比较数、新增历史馆藏数据量只取决于受影响组件大小，不随全库规模增长**。演示在干净库与含 5 万无关记录的大库上执行同一串 20 次变更，三项工作量逐次完全相同。
+因此小批变更的**读取来源记录数、匹配比较数、新增历史馆藏数据量与审计行数只取决于受影响组件大小，不随全库规模增长**。演示在干净库与含 5 万无关记录的大库上执行同一串 20 次变更，四项逐次完全相同。
 
 ## 崩溃恢复
 

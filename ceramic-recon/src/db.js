@@ -95,7 +95,8 @@ create table if not exists publications(
   version integer primary key,
   created_at bigint not null,
   reason varchar,
-  stats varchar not null
+  stats varchar not null,
+  audit_complete boolean
 );
 create table if not exists group_lineage(
   gid varchar primary key,
@@ -108,6 +109,7 @@ create table if not exists recompute_log(
   source_records_read integer not null,
   comparisons integer not null,
   new_group_rows integer not null,
+  audit_rows integer not null,
   duration_ms integer not null
 );
 create table if not exists outbox(
@@ -162,12 +164,32 @@ create table if not exists evidence_events(
   k2 varchar not null,
   confidence double not null,
   evidence varchar not null,
-  outcome varchar not null
+  outcome varchar not null,
+  blocked_by_batch varchar,
+  blocked_pair varchar,
+  cut_reason varchar
+);
+-- 每版有效异件判定的快照（只追加）：撤回判异后，旧版本的裁决依据仍可复核
+create table if not exists heterology_events(
+  event_id bigint primary key default nextval('rv_seq'),
+  version integer not null,
+  k1 varchar not null,
+  k2 varchar not null,
+  batch_id varchar not null
 );
 create index if not exists idx_group_events_ver on group_events(version);
 create index if not exists idx_membership_events_ver on membership_events(version);
 create index if not exists idx_membership_events_k on membership_events(k);
 create index if not exists idx_evidence_ver on evidence_events(version);
+create index if not exists idx_heterology_events_ver on heterology_events(version);
+
+-- 旧库升级：补齐新增列（存在则跳过）。旧库中已发布的版本 audit_complete 为 null，
+-- 表示其裁决依据可能无法完整还原，读取时会逐项标明缺失。
+alter table publications add column if not exists audit_complete boolean;
+alter table evidence_events add column if not exists blocked_by_batch varchar;
+alter table evidence_events add column if not exists blocked_pair varchar;
+alter table evidence_events add column if not exists cut_reason varchar;
+alter table recompute_log add column if not exists audit_rows integer;
 create view if not exists v_active_records as
 select rv.*
 from record_versions rv

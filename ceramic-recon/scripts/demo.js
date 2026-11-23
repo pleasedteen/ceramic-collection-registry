@@ -50,6 +50,32 @@ async function showGroups(db, title) {
       `     品名=${g.fields.name}（出处:${g.fieldSources.name}） 材质=${g.fields.material}（出处:${g.fieldSources.material}） 刻款=${g.fields.mark} 高度=${g.fields.height}`
     );
   }
+  await showVersionAudit(db, r.version);
+}
+
+// 打印某一版的合并/拆分统计与逐边裁决（可由 /versions/:v 独立复核）
+async function showVersionAudit(db, version) {
+  const d = await queries.versionDetail(db, version);
+  if (!d) return;
+  const ms = d.mergeSplit;
+  console.log(
+    `   └ 审计 v${version}：合并 ${ms.mergeCount} 个，拆分 ${ms.splitCount} 个` +
+      `；边——实际连通 ${d.edges.connected.length}、冗余匹配 ${d.edges.redundant.length}、被异件拦下 ${d.edges.cut.length}` +
+      `${d.audit.complete ? '' : '（依据不完整：' + d.audit.missing.join('；') + '）'}`
+  );
+  for (const m of ms.merges) {
+    console.log(`      合并 → ${m.gid}：汇入自 [${m.contributors.map((c) => c.gid).join(', ')}]`);
+  }
+  for (const s of ms.splits) {
+    console.log(
+      `      拆分 ← ${s.gid}：流向 [${s.destinations.map((x) => x.gid).join(', ')}]`
+    );
+  }
+  for (const e of d.edges.cut) {
+    console.log(
+      `      拦下边 ${e.k1} ✕ ${e.k2}（批次 ${e.blockedByBatch || '缺失'}）`
+    );
+  }
 }
 
 // 同一串 20 次小批变更：10 次更正 + 10 次撤回，交替进行，每次后发布
@@ -111,6 +137,7 @@ function summarize(log) {
     reads: r.source_records_read,
     comparisons: r.comparisons,
     newGroups: r.new_group_rows,
+    auditRows: r.audit_rows,
   }));
 }
 
@@ -171,17 +198,21 @@ async function main() {
   const cleanSum = summarize(cleanLog);
   const bigSum = summarize(bigLog);
 
-  console.log('\n每次发布的三项工作量（左：干净库 / 右：含 5 万无关记录的大库）：');
-  console.log('次数 | 读取记录(clean/big) | 匹配比较(clean/big) | 新增馆藏(clean/big)');
+  console.log('\n每次发布的工作量与审计增量（左：干净库 / 右：含 5 万无关记录的大库）：');
+  console.log('次数 | 读取记录(clean/big) | 匹配比较(clean/big) | 新增馆藏(clean/big) | 审计行(clean/big)');
   for (let i = 0; i < cleanSum.length; i++) {
     const c = cleanSum[i];
     const b = bigSum[i];
     const same =
-      c.reads === b.reads && c.comparisons === b.comparisons && c.newGroups === b.newGroups;
+      c.reads === b.reads &&
+      c.comparisons === b.comparisons &&
+      c.newGroups === b.newGroups &&
+      c.auditRows === b.auditRows;
     console.log(
       `${String(i + 1).padStart(2)}   | ${String(c.reads).padStart(4)} / ${String(b.reads).padStart(6)}` +
         `       | ${String(c.comparisons).padStart(4)} / ${String(b.comparisons).padStart(6)}` +
         `        | ${String(c.newGroups).padStart(4)} / ${String(b.newGroups).padStart(6)}` +
+        `        | ${String(c.auditRows).padStart(4)} / ${String(b.auditRows).padStart(6)}` +
         `   ${same ? '✓ 相同' : '✗ 不一致'}`
     );
   }
@@ -192,19 +223,27 @@ async function main() {
         reads: acc.reads + r.reads,
         comparisons: acc.comparisons + r.comparisons,
         newGroups: acc.newGroups + r.newGroups,
+        auditRows: acc.auditRows + r.auditRows,
       }),
-      { reads: 0, comparisons: 0, newGroups: 0 }
+      { reads: 0, comparisons: 0, newGroups: 0, auditRows: 0 }
     );
   const tc = totals(cleanSum);
   const tb = totals(bigSum);
   console.log('\n20 次发布累计：');
-  console.log(`  干净库：读取 ${tc.reads} 条，比较 ${tc.comparisons} 次，新增馆藏数据 ${tc.newGroups} 行`);
-  console.log(`  大库  ：读取 ${tb.reads} 条，比较 ${tb.comparisons} 次，新增馆藏数据 ${tb.newGroups} 行`);
+  console.log(
+    `  干净库：读取 ${tc.reads} 条，比较 ${tc.comparisons} 次，新增馆藏数据 ${tc.newGroups} 行，审计行 ${tc.auditRows}`
+  );
+  console.log(
+    `  大库  ：读取 ${tb.reads} 条，比较 ${tb.comparisons} 次，新增馆藏数据 ${tb.newGroups} 行，审计行 ${tb.auditRows}`
+  );
   const invariantHolds =
-    tc.reads === tb.reads && tc.comparisons === tb.comparisons && tc.newGroups === tb.newGroups;
+    tc.reads === tb.reads &&
+    tc.comparisons === tb.comparisons &&
+    tc.newGroups === tb.newGroups &&
+    tc.auditRows === tb.auditRows;
   console.log(
     invariantHolds
-      ? '\n结论 ✓：加入 5 万条无关馆藏后，相同变更的三项工作量完全相同，不随全库规模增长。'
+      ? '\n结论 ✓：加入 5 万条无关馆藏后，相同变更的各项工作量与审计增量完全相同，不随全库规模增长。'
       : '\n结论 ✗：工作量随规模发生变化，需要检查分块增量逻辑。'
   );
 

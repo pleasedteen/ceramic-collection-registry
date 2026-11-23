@@ -406,48 +406,69 @@ class UnionFind {
 
 // 确定性分区（并查集）：
 //   匹配边已按“置信度降序；同分按最小端点编号降序、再最大端点降序”排序。
-//   逐条合并：异件对的匹配边直接剪开；其余边若合并会使某条有效异件判定两端
-//   落入同一组，也剪开跳过。冲突因此按置信度优先、同分按固定公开规则处理，
-//   且异件两端必属不同馆藏。
-function partitionGroups(keys, sortedMatchEdges, heterologySet) {
+//   逐条合并并给每条边定裁决：
+//     - connected  实际连通：该边第一次把两个不同组件合并；
+//     - redundant  冗余匹配：两端此前已属同一组件（成环），不改变归组；
+//     - cut        被异件判定拦下：该边本身是异件对，或合并会使某条有效异件
+//                  判定两端同组；记录拦下它的异件批次 blockedByBatch。
+//   异件两端因此必属不同馆藏。
+function partitionGroups(keys, sortedMatchEdges, heterologyEdges) {
   const uf = new UnionFind(keys);
-  const cutEdges = [];
+  const edgeOutcomes = [];
 
-  const heteroByNode = new Map(keys.map((k) => [k, new Set()]));
-  for (const token of heterologySet) {
-    const [a, b] = token.split('#');
-    if (heteroByNode.has(a) && heteroByNode.has(b)) {
-      heteroByNode.get(a).add(b);
-      heteroByNode.get(b).add(a);
+  const heteroByNode = new Map(keys.map((k) => [k, new Map()]));
+  const heteroPairBatch = new Map();
+  for (const e of heterologyEdges) {
+    if (heteroByNode.has(e.k1) && heteroByNode.has(e.k2)) {
+      heteroByNode.get(e.k1).set(e.k2, e.batchId);
+      heteroByNode.get(e.k2).set(e.k1, e.batchId);
+      heteroPairBatch.set([e.k1, e.k2].sort().join('#'), e.batchId);
     }
   }
 
-  const wouldViolate = (k1, k2) => {
+  const membersOf = (root) => keys.filter((k) => uf.find(k) === root);
+  // 若合并会违反某条有效异件判定，返回该异件对及其批次
+  const findViolation = (k1, k2) => {
     const r1 = uf.find(k1);
     const r2 = uf.find(k2);
-    if (r1 === r2) return false;
-    const members1 = new Set(keys.filter((k) => uf.find(k) === r1));
-    const members2 = new Set(keys.filter((k) => uf.find(k) === r2));
-    for (const a of members1) {
-      for (const b of heteroByNode.get(a)) {
-        if (members2.has(b)) return true;
+    if (r1 === r2) return null;
+    const members2 = new Set(membersOf(r2));
+    for (const a of membersOf(r1)) {
+      const nb = heteroByNode.get(a);
+      if (!nb) continue;
+      for (const b of members2) {
+        if (nb.has(b)) return { k1: a, k2: b, batchId: nb.get(b) };
       }
     }
-    return false;
+    return null;
   };
 
   for (const e of sortedMatchEdges) {
     if (!uf.parent.has(e.k1) || !uf.parent.has(e.k2)) continue;
     const token = [e.k1, e.k2].sort().join('#');
-    if (heterologySet.has(token)) {
-      cutEdges.push(e); // 异件凌驾匹配
+    const base = { k1: e.k1, k2: e.k2, confidence: e.confidence, evidence: e.evidence };
+    const directBatch = heteroPairBatch.get(token);
+    if (directBatch !== undefined) {
+      edgeOutcomes.push({ ...base, outcome: 'cut', blockedByBatch: directBatch, cutReason: 'heterology' });
       continue;
     }
-    if (wouldViolate(e.k1, e.k2)) {
-      cutEdges.push(e);
+    if (uf.find(e.k1) === uf.find(e.k2)) {
+      edgeOutcomes.push({ ...base, outcome: 'redundant' });
+      continue;
+    }
+    const violated = findViolation(e.k1, e.k2);
+    if (violated) {
+      edgeOutcomes.push({
+        ...base,
+        outcome: 'cut',
+        blockedByBatch: violated.batchId,
+        blockedPair: [violated.k1, violated.k2].sort(),
+        cutReason: 'would_violate',
+      });
       continue;
     }
     uf.union(e.k1, e.k2);
+    edgeOutcomes.push({ ...base, outcome: 'connected' });
   }
 
   const groupsMap = new Map();
@@ -458,7 +479,7 @@ function partitionGroups(keys, sortedMatchEdges, heterologySet) {
   }
   const groups = [...groupsMap.values()].map((g) => g.sort());
   groups.sort((a, b) => (a[0] < b[0] ? -1 : 1));
-  return { groups, cutEdges };
+  return { groups, edgeOutcomes, cutEdges: edgeOutcomes.filter((o) => o.outcome === 'cut') };
 }
 
 function isBlank(v) {
@@ -520,7 +541,9 @@ async function recompute(db, affectedHint, firstPublish) {
     affected = new Set(all.map((r) => keyOf(r.source, r.source_id)));
   }
   // 异件边端点始终纳入，保证判异约束参与分区
-  const edgesAll = await db.all('select k1, k2 from v_active_heterology');
+  const edgesAll = await db.all(
+    'select k1, k2, batch_id as batchId from v_active_heterology'
+  );
   for (const e of edgesAll) {
     affected.add(e.k1);
     affected.add(e.k2);
@@ -634,18 +657,16 @@ async function recompute(db, affectedHint, firstPublish) {
     return 0;
   });
 
-  const heterologySet = new Set(
-    edgesAll
-      .filter((e) => affected.has(e.k1) && affected.has(e.k2))
-      .map((e) => [e.k1, e.k2].sort().join('#'))
+  const heterologyEdges = edgesAll.filter(
+    (e) => affected.has(e.k1) && affected.has(e.k2)
   );
 
   // 仅在受影响子图上分区；scope 中非受影响成员只作比较参照，归属保持不变
   const affectedKeys = [...affected].filter((k) => recMap.has(k)).sort();
-  const { groups: newGroups, cutEdges: cutEdgesAll } = partitionGroups(
+  const { groups: newGroups, edgeOutcomes } = partitionGroups(
     affectedKeys,
     matchEdges,
-    heterologySet
+    heterologyEdges
   );
   newGroups.sort((a, b) => (a[0] < b[0] ? -1 : 1));
 
@@ -695,7 +716,7 @@ async function recompute(db, affectedHint, firstPublish) {
   return {
     resultGroups,
     recMap,
-    cutEdgesAll,
+    edgeOutcomes,
     matchEdges,
     prevK2Gid,
     prevGid2Members,
@@ -815,41 +836,59 @@ async function doPublish(db, reason) {
   await insertChunked(db, 'membership_events', ['version', 'k', 'gid', 'op'], leaveRows, '(?, ?, ?, ?)');
   await insertChunked(db, 'membership_events', ['version', 'k', 'gid', 'op'], joinRows, '(?, ?, ?, ?)');
 
-  // 4) 证据留痕：本次比较产生的匹配边（joined）与剪开边（cut）
-  const cutToken = new Set(r.cutEdgesAll.map((e) => [e.k1, e.k2].sort().join('#')));
+  // 4) 证据留痕：本次比较产生的匹配边，逐条记录裁决
+  //    connected（实际连通）/ redundant（冗余匹配，不改变归组）/ cut（被异件判定拦下）
   const evidenceRows = [];
-  for (const e of r.matchEdges) {
-    const token = [e.k1, e.k2].sort().join('#');
+  for (const e of r.edgeOutcomes) {
     evidenceRows.push([
       version, e.k1, e.k2, e.confidence,
       JSON.stringify(e.evidence),
-      cutToken.has(token) ? 'cut' : 'joined',
+      e.outcome,
+      e.blockedByBatch || null,
+      e.blockedPair ? JSON.stringify(e.blockedPair) : null,
+      e.cutReason || null,
     ]);
   }
   await insertChunked(
     db,
     'evidence_events',
-    ['version', 'k1', 'k2', 'confidence', 'evidence', 'outcome'],
+    ['version', 'k1', 'k2', 'confidence', 'evidence', 'outcome', 'blocked_by_batch', 'blocked_pair', 'cut_reason'],
     evidenceRows,
-    '(?, ?, ?, ?, ?, ?)'
+    '(?, ?, ?, ?, ?, ?, ?, ?, ?)'
   );
 
-  const stats = { ...r.metrics, groupCount: keepCount + r.resultGroups.length };
-  await db.run('insert into publications(version, created_at, reason, stats) values(?, ?, ?, ?)', [
-    version,
-    now(),
-    reason,
-    JSON.stringify(stats),
-  ]);
+  // 5) 有效异件判定快照（只追加）：仅记录受影响子图内的异件判定，供旧版本复核
+  //    判异依据；与本次重算范围一致，因此不随无关馆藏规模增长。
+  const affectedKeySet = new Set(r.metrics.affectedKeys);
+  const heterologyRows = (
+    await db.all('select batch_id, k1, k2 from v_active_heterology')
+  )
+    .filter((e) => affectedKeySet.has(e.k1) || affectedKeySet.has(e.k2))
+    .map((e) => [version, e.k1, e.k2, e.batch_id]);
+  await insertChunked(
+    db,
+    'heterology_events',
+    ['version', 'k1', 'k2', 'batch_id'],
+    heterologyRows,
+    '(?, ?, ?, ?)'
+  );
+
+  const auditRows = evidenceRows.length + heterologyRows.length;
+  const stats = { ...r.metrics, groupCount: keepCount + r.resultGroups.length, auditRows };
   await db.run(
-    `insert into recompute_log(version, touched_keys, source_records_read, comparisons, new_group_rows, duration_ms)
-     values(?, ?, ?, ?, ?, ?)`,
+    'insert into publications(version, created_at, reason, stats, audit_complete) values(?, ?, ?, ?, ?)',
+    [version, now(), reason, JSON.stringify(stats), true]
+  );
+  await db.run(
+    `insert into recompute_log(version, touched_keys, source_records_read, comparisons, new_group_rows, audit_rows, duration_ms)
+     values(?, ?, ?, ?, ?, ?, ?)`,
     [
       version,
       JSON.stringify(r.metrics.affectedKeys),
       r.metrics.sourceRecordsRead,
       r.metrics.comparisons,
       r.metrics.newGroupRows,
+      auditRows,
       r.metrics.durationMs,
     ]
   );

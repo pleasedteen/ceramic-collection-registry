@@ -174,48 +174,200 @@ async function buildVersionSnapshot(db, version) {
     .sort((a, b) => (a.members[0] < b.members[0] ? -1 : 1));
 }
 
-// 版本详情：馆藏、字段出处、合并/拆分依据
+function sameSet(a, b) {
+  if (a.size !== b.size) return false;
+  for (const x of a) if (!b.has(x)) return false;
+  return true;
+}
+
+// 按“成员去向”统计合并与拆分：
+//   - 合并：某新馆藏的成员来自 ≥2 个旧馆藏（每条 ≥1 名成员）；
+//   - 拆分：某旧馆藏的幸存成员流向 ≥2 个新馆藏。
+//   仅扩员（吸收全新记录）或仅撤回成员（幸存者仍聚在同一馆藏）都不算拆分；
+//   交叉重组（旧馆藏被拆到多处、新馆藏又由多处汇入）可同时计入两类。
+function summarizeLineage(prevGroups, groups) {
+  const prevMemberToGid = new Map();
+  for (const pg of prevGroups) for (const m of pg.members) prevMemberToGid.set(m, pg.gid);
+  const succMemberToGid = new Map();
+  for (const g of groups) for (const m of g.members) succMemberToGid.set(m, g.gid);
+  const prevByGid = new Map(prevGroups.map((p) => [p.gid, p]));
+
+  // 各新馆藏的贡献者（旧馆藏 -> 汇入的成员）
+  const contributorsBySucc = new Map();
+  for (const g of groups) {
+    const c = new Map();
+    for (const m of g.members) {
+      const pg = prevMemberToGid.get(m);
+      if (pg === undefined) continue;
+      if (!c.has(pg)) c.set(pg, []);
+      c.get(pg).push(m);
+    }
+    contributorsBySucc.set(g.gid, c);
+  }
+  // 各旧馆藏的成员去向（新馆藏 -> 流入的幸存成员）；撤回/消失的成员不计
+  const destByPrev = new Map();
+  for (const pg of prevGroups) {
+    const d = new Map();
+    for (const m of pg.members) {
+      const sg = succMemberToGid.get(m);
+      if (sg === undefined) continue;
+      if (!d.has(sg)) d.set(sg, []);
+      d.get(sg).push(m);
+    }
+    destByPrev.set(pg.gid, d);
+  }
+
+  const splitGids = new Set();
+  for (const [pgid, d] of destByPrev) if (d.size >= 2) splitGids.add(pgid);
+
+  const merges = [];
+  const splits = [];
+  const byGid = new Map();
+  for (const g of groups) {
+    const contrib = contributorsBySucc.get(g.gid);
+    const isMerge = contrib.size >= 2;
+    const isPartOfSplit = [...contrib.keys()].some((pg) => splitGids.has(pg));
+    let unchanged = false;
+    let gained = false;
+    let lost = false;
+    if (contrib.size === 1) {
+      const [pgid, shared] = [...contrib.entries()][0];
+      const prev = prevByGid.get(pgid);
+      const prevMembers = new Set(prev.members);
+      const curMembers = new Set(g.members);
+      unchanged = sameSet(prevMembers, curMembers);
+      gained = g.members.length > shared.length; // 含无旧归属的全新记录（扩员）
+      lost = prev.members.length > shared.length; // 旧成员未出现在此（撤回或移出）
+    }
+    let kind;
+    if (contrib.size === 0) kind = 'new';
+    else if (isMerge && isPartOfSplit) kind = 'merge+split';
+    else if (isMerge) kind = 'merge';
+    else if (isPartOfSplit) kind = 'split';
+    else if (unchanged) kind = 'unchanged';
+    else if (gained && !lost) kind = 'expanded';
+    else if (lost && !gained) kind = 'contracted';
+    else kind = 'changed';
+
+    const predecessors = [...contrib.entries()]
+      .map(([gid, shared]) => ({ gid, shared: shared.slice().sort() }))
+      .sort((a, b) => (a.gid < b.gid ? -1 : 1));
+    byGid.set(g.gid, { kind, merge: isMerge, split: isPartOfSplit, predecessors });
+    if (isMerge) merges.push({ gid: g.gid, contributors: predecessors });
+  }
+  for (const pg of prevGroups) {
+    const d = destByPrev.get(pg.gid);
+    if (!d || d.size < 2) continue;
+    const destinations = [...d.entries()]
+      .map(([gid, moved]) => ({ gid, members: moved.slice().sort() }))
+      .sort((a, b) => (a.gid < b.gid ? -1 : 1));
+    splits.push({ gid: pg.gid, members: pg.members.slice(), destinations });
+  }
+  merges.sort((a, b) => (a.gid < b.gid ? -1 : 1));
+  splits.sort((a, b) => (a.gid < b.gid ? -1 : 1));
+  return { byGid, merges, splits };
+}
+
+// 版本详情：馆藏、字段出处、合并/拆分依据、逐边裁决
+// 所有依据都来自只追加事件，撤回判异或重开同一数据库后仍可回放旧版本。
 async function versionDetail(db, version) {
   const row = await getVersionRow(db, version);
   if (!row) return null;
   const groups = await buildVersionSnapshot(db, version);
   const prevGroups = version > 1 ? await buildVersionSnapshot(db, version - 1) : [];
-  const enriched = groups.map((g) => {
-    const memberSet = new Set(g.members);
-    const hits = prevGroups
-      .filter((pg) => pg.members.some((m) => memberSet.has(m)))
-      .map((pg) => ({ gid: pg.gid, shared: pg.members.filter((m) => memberSet.has(m)) }));
-    const basis = { kind: 'new', predecessors: hits };
-    if (hits.length > 1) basis.kind = 'merge';
-    else if (hits.length === 1) {
-      const prev = prevGroups.find((x) => x.gid === hits[0].gid);
-      const prevSize = prev ? prev.members.length : 0;
-      basis.kind =
-        hits[0].shared.length === prevSize && hits[0].shared.length === g.members.length
-          ? 'unchanged'
-          : 'split';
-    }
-    return { ...g, lineageBasis: basis };
-  });
+
+  const lineage = summarizeLineage(prevGroups, groups);
+  const enriched = groups.map((g) => ({ ...g, lineageBasis: lineage.byGid.get(g.gid) }));
+
+  // 受影响子图（本次发布实际重算的键）与逐边裁决
+  const logRows = await db.all('select * from recompute_log where version = ?', [version]);
+  const affectedKeys = logRows.length ? JSON.parse(logRows[0].touched_keys) : [];
+
   const evidence = await db.all('select * from evidence_events where version = ? order by event_id', [
     version,
   ]);
-  const cutEdges = evidence
-    .filter((e) => e.outcome === 'cut')
-    .map((e) => ({
+  /** @type {{ connected: any[], redundant: any[], cut: any[], unknown: any[] }} */
+  const edges = { connected: [], redundant: [], cut: [], unknown: [] };
+  // seq = 边的处理次序（同一发布内按置信度降序、同分固定规则）。把四类边按 seq
+  // 归并即可独立复算：逐边并查集，connected 合并、redundant/cut 不合并。
+  let seq = 0;
+  for (const e of evidence) {
+    const shaped = {
+      seq: seq++,
       k1: e.k1,
       k2: e.k2,
       confidence: e.confidence,
       evidence: JSON.parse(e.evidence),
-      reason: '异件强制拆分，该匹配边被剪开（同分按编号固定规则处理）',
-    }));
+      outcome: e.outcome,
+    };
+    if (e.outcome === 'connected' || e.outcome === 'redundant') {
+      edges[e.outcome].push(shaped);
+    } else if (e.outcome === 'cut') {
+      edges.cut.push({
+        ...shaped,
+        blockedByBatch: e.blocked_by_batch || null,
+        blockedPair: e.blocked_pair ? JSON.parse(e.blocked_pair) : null,
+        reason:
+          e.cut_reason === 'heterology'
+            ? '该匹配边两端即有效异件对，被异件判定直接剪开'
+            : '合并会使某条有效异件判定两端同组，故跳过该边',
+      });
+    } else {
+      // 旧库只记录 joined/cut，无法区分实际连通与冗余匹配
+      edges.unknown.push({ ...shaped, legacyOutcome: e.outcome });
+    }
+  }
+  const orderedEdges = [...edges.connected, ...edges.redundant, ...edges.cut, ...edges.unknown].sort(
+    (a, b) => a.seq - b.seq
+  );
+
+  // 当版有效异件判定快照（只追加）
+  const heterology = await db.all(
+    'select k1, k2, batch_id from heterology_events where version = ? order by event_id',
+    [version]
+  );
+
+  // 旧库（升级前写入）没有可完整还原的依据：audit_complete 为空即标明缺失
+  const complete = row.audit_complete === true;
+  const edgeDispositionComplete =
+    complete && edges.unknown.length === 0 && edges.cut.every((e) => e.blockedByBatch);
+  const heterologyBasisComplete = complete;
+  const missing = [];
+  if (!edgeDispositionComplete) {
+    missing.push('edgeDisposition：旧库未记录逐边“实际连通/冗余匹配/被异件拦下”的区分');
+  }
+  if (!heterologyBasisComplete) {
+    missing.push('heterologyBasis：旧库未保存当版有效异件判定快照');
+  }
+  if (edges.cut.some((e) => !e.blockedByBatch)) {
+    missing.push('cutBlockedBy：旧库未记录拦下匹配边的异件批次');
+  }
+
   return {
     version,
     createdAt: row.created_at,
     reason: row.reason,
     stats: JSON.parse(row.stats),
+    audit: {
+      complete,
+      edgeDispositionComplete,
+      heterologyBasisComplete,
+      missing,
+    },
+    affectedKeys,
+    mergeSplit: {
+      mergeCount: lineage.merges.length,
+      splitCount: lineage.splits.length,
+      merges: lineage.merges,
+      splits: lineage.splits,
+    },
     groups: enriched,
-    cutEdges,
+    edges,
+    // 逐边处理次序（可独立复算归组）：按 seq 逐边并查集即可重现分组
+    edgeOrder: orderedEdges.map((e) => ({ seq: e.seq, k1: e.k1, k2: e.k2, outcome: e.outcome || 'legacy' })),
+    heterology,
+    // 向后兼容字段：剪开的边（含拦下它的异件批次）
+    cutEdges: edges.cut,
   };
 }
 
