@@ -1,5 +1,5 @@
 'use strict';
-const { keyOf, parseKey, SOURCES } = require('./db');
+const { keyOf, parseKey, SOURCES, CURRENT_FORMAT } = require('./db');
 const {
   normalizeRecord,
   scorePair,
@@ -409,7 +409,8 @@ class UnionFind {
 //   逐条合并：异件对的匹配边直接剪开；其余边若合并会使某条有效异件判定两端
 //   落入同一组，也剪开跳过。冲突因此按置信度优先、同分按固定公开规则处理，
 //   且异件两端必属不同馆藏。
-function partitionGroups(keys, sortedMatchEdges, heterologySet) {
+// heterologyBatch: token（两键排序后以 # 连接）→ 判异批次编号，用于记录“当时阻断它的判异批次”。
+function partitionGroups(keys, sortedMatchEdges, heterologySet, heterologyBatch = new Map()) {
   const uf = new UnionFind(keys);
   const cutEdges = [];
 
@@ -422,31 +423,59 @@ function partitionGroups(keys, sortedMatchEdges, heterologySet) {
     }
   }
 
-  const wouldViolate = (k1, k2) => {
+  // 返回若合并 k1、k2 会被触发（两端分属两组件）的全部异件对
+  const violatingPairs = (k1, k2) => {
     const r1 = uf.find(k1);
     const r2 = uf.find(k2);
-    if (r1 === r2) return false;
+    if (r1 === r2) return [];
     const members1 = new Set(keys.filter((k) => uf.find(k) === r1));
     const members2 = new Set(keys.filter((k) => uf.find(k) === r2));
+    const seen = new Set();
+    const pairs = [];
     for (const a of members1) {
-      for (const b of heteroByNode.get(a)) {
-        if (members2.has(b)) return true;
+      for (const b of heteroByNode.get(a) || []) {
+        if (members2.has(b)) {
+          const pair = [a, b].sort();
+          const token = pair.join('#');
+          if (!seen.has(token)) {
+            seen.add(token);
+            pairs.push({ k1: pair[0], k2: pair[1], batchId: heterologyBatch.get(token) || null });
+          }
+        }
       }
     }
-    return false;
+    pairs.sort((x, y) => (x.k1 + '#' + x.k2 < y.k1 + '#' + y.k2 ? -1 : 1));
+    return pairs;
   };
 
   for (const e of sortedMatchEdges) {
     if (!uf.parent.has(e.k1) || !uf.parent.has(e.k2)) continue;
     const token = [e.k1, e.k2].sort().join('#');
     if (heterologySet.has(token)) {
-      cutEdges.push(e); // 异件凌驾匹配
+      // 异件凌驾匹配：直判异
+      cutEdges.push({
+        ...e,
+        block: {
+          kind: 'direct',
+          pairs: [
+            {
+              k1: token.split('#')[0],
+              k2: token.split('#')[1],
+              batchId: heterologyBatch.get(token) || null,
+            },
+          ],
+        },
+      });
       continue;
     }
-    if (wouldViolate(e.k1, e.k2)) {
-      cutEdges.push(e);
+    const pairs = violatingPairs(e.k1, e.k2);
+    if (pairs.length) {
+      // 间接阻断：合并会让某条有效异件判定两端同组
+      cutEdges.push({ ...e, block: { kind: 'indirect', pairs } });
       continue;
     }
+    // 记录该匹配边是否真的促成了归并（两端原属不同组件）
+    e.contributed = uf.find(e.k1) !== uf.find(e.k2);
     uf.union(e.k1, e.k2);
   }
 
@@ -520,11 +549,17 @@ async function recompute(db, affectedHint, firstPublish) {
     affected = new Set(all.map((r) => keyOf(r.source, r.source_id)));
   }
   // 异件边端点始终纳入，保证判异约束参与分区
-  const edgesAll = await db.all('select k1, k2 from v_active_heterology');
+  const edgesAll = await db.all('select k1, k2, batch_id from v_active_heterology');
+  const heterologyBatch = new Map();
   for (const e of edgesAll) {
+    heterologyBatch.set([e.k1, e.k2].sort().join('#'), e.batch_id);
     affected.add(e.k1);
     affected.add(e.k2);
   }
+
+  // 读取受影响边当前生效的证据状态（用于“只在边变化时记历史”）。
+  // 上一发布的有效证据 = version<=上一版的最新事件；首版无历史。
+  let prevEvidence = new Map();
 
   // 读取受影响成员当前归属（首版为空）
   let prevK2Gid = new Map();
@@ -587,6 +622,37 @@ async function recompute(db, affectedHint, firstPublish) {
   }
   const sourceRecordsRead = activeRows.length;
 
+  // 子图确定后，读取至少一端落在受影响子图内的边的最新有效证据。
+  // 内层先过滤再取每边最新事件，读取量只随受影响边数增长，不随无关发布增长。
+  if (!firstPublish) {
+    const list = [...affected];
+    for (let s = 0; s < list.length; s += 400) {
+      const part = list.slice(s, s + 400);
+      const ph = part.map(() => '?').join(',');
+      const rows = await db.all(
+        `select q.k1, q.k2, q.outcome, q.confidence, q.evidence, q.contributed,
+                q.block_kind, q.block_batches, q.format_version
+         from (
+           select k1, k2, outcome, confidence, evidence, contributed, block_kind, block_batches,
+                  format_version, row_number() over (partition by k1, k2 order by event_id desc) rn
+           from evidence_events where k1 in (${ph}) or k2 in (${ph})
+         ) q where q.rn = 1`,
+        [...part, ...part]
+      );
+      for (const row of rows) {
+        prevEvidence.set(`${row.k1}#${row.k2}`, {
+          outcome: row.outcome,
+          confidence: row.confidence,
+          evidence: row.evidence,
+          contributed: row.contributed,
+          blockKind: row.block_kind,
+          blockBatches: row.block_batches,
+          formatVersion: row.format_version === null ? null : Number(row.format_version),
+        });
+      }
+    }
+  }
+
   const recMap = new Map();
   for (const r of activeRows) {
     const k = keyOf(r.source, r.source_id);
@@ -645,7 +711,8 @@ async function recompute(db, affectedHint, firstPublish) {
   const { groups: newGroups, cutEdges: cutEdgesAll } = partitionGroups(
     affectedKeys,
     matchEdges,
-    heterologySet
+    heterologySet,
+    heterologyBatch
   );
   newGroups.sort((a, b) => (a[0] < b[0] ? -1 : 1));
 
@@ -656,13 +723,15 @@ async function recompute(db, affectedHint, firstPublish) {
   }
   const resultGroups = [];
   const newLineage = [];
-  const needNew = newGroups.filter((members) => !prevSig.has(members.join(','))).length;
-  let firstSeq = 0;
-  let seqCursor = 0;
-  if (needNew > 0) {
-    const row = await db.all(`select nextval('gid_seq') as v from range(${needNew})`);
-    firstSeq = Number(row[0].v);
-  }
+  // 新编号从“已存在的最大编号”之后分配。不用序列：DuckDB 尾部 nextval 未必落盘，
+  // 旧库迁移后重启可能重置序列，导致编号冲突。这里以实际已分配编号为准，稳健且可复算。
+  const maxRow = await db.all(
+    `select max(try_cast(substr(gid, 2) as bigint)) m from (
+       select gid from group_lineage
+       union all select gid from live_groups
+     )`
+  );
+  let nextSeqNo = Number(maxRow[0].m || 0);
   let newGroupRows = 0;
   const reusedGids = new Set();
   for (const members of newGroups) {
@@ -671,8 +740,8 @@ async function recompute(db, affectedHint, firstPublish) {
     if (gid) {
       reusedGids.add(gid);
     } else {
-      seqCursor += 1;
-      gid = `G${String(firstSeq + seqCursor - 1).padStart(6, '0')}`;
+      nextSeqNo += 1;
+      gid = `G${String(nextSeqNo).padStart(6, '0')}`;
       newGroupRows += 1;
       newLineage.push([gid, null]);
     }
@@ -692,11 +761,57 @@ async function recompute(db, affectedHint, firstPublish) {
     if (prevK2Gid.has(k)) touchedOldGids.add(prevK2Gid.get(k));
   }
 
+  // 本次受影响子图内所有“有效匹配边”的规范状态：促成归并（joined）或被拒（cut）。
+  // 以此与上一发布的有效状态逐边比对，只有发生变化的边才写入证据历史。
+  const cutByToken = new Map();
+  for (const c of cutEdgesAll) cutByToken.set([c.k1, c.k2].sort().join('#'), c);
+  const currentEdges = new Map();
+  for (const e of matchEdges) {
+    const token = [e.k1, e.k2].sort().join('#');
+    const cut = cutByToken.get(token);
+    if (cut) {
+      currentEdges.set(token, {
+        k1: token.split('#')[0],
+        k2: token.split('#')[1],
+        confidence: e.confidence,
+        evidence: JSON.stringify(e.evidence),
+        outcome: 'cut',
+        contributed: false,
+        blockKind: cut.block.kind,
+        blockBatches: JSON.stringify(cut.block.pairs),
+      });
+    } else {
+      currentEdges.set(token, {
+        k1: token.split('#')[0],
+        k2: token.split('#')[1],
+        confidence: e.confidence,
+        evidence: JSON.stringify(e.evidence),
+        outcome: 'joined',
+        contributed: !!e.contributed,
+        blockKind: null,
+        blockBatches: null,
+      });
+    }
+  }
+  const removedTokens = [];
+  for (const [token, prev] of prevEvidence) {
+    if (currentEdges.has(token)) continue;
+    if (prev.outcome !== 'joined' && prev.outcome !== 'cut') continue;
+    // 只有两端都在本次受影响子图内时，边的消失才是本次可证实的结论；
+    // 一端在子图外的历史边不在本次比较范围内，不能误记为 removed。
+    const [a, b] = token.split('#');
+    if (!affected.has(a) || !affected.has(b)) continue;
+    removedTokens.push(token);
+  }
+
   return {
     resultGroups,
     recMap,
     cutEdgesAll,
     matchEdges,
+    currentEdges,
+    prevEvidence,
+    removedTokens,
     prevK2Gid,
     prevGid2Members,
     touchedOldGids,
@@ -756,6 +871,17 @@ async function doPublish(db, reason) {
   const leaveRows = [];
   const joinRows = [];
   const liveMemberRows = [];
+  // 受影响旧馆藏的原字段（用于判断沿用编号的馆藏字段是否变化，变化则记 change 事件，
+  // 保证按版本回放的字段与出处也与当时一致）
+  const prevFieldRows = new Map();
+  if (!firstPublish && r.touchedOldGids.size) {
+    for (let s = 0; s < [...r.touchedOldGids].length; s += 500) {
+      const part = [...r.touchedOldGids].slice(s, s + 500);
+      const ph = part.map(() => '?').join(',');
+      const got = await db.all(`select * from live_groups where gid in (${ph})`, part);
+      for (const row of got) prevFieldRows.set(row.gid, row);
+    }
+  }
   for (const g of r.resultGroups) {
     const isNew = !r.prevGid2Members.has(g.gid);
     liveGroupRows.push([
@@ -773,6 +899,28 @@ async function doPublish(db, reason) {
         JSON.stringify({ fields: g.fields, fieldSources: g.fieldSources }),
         JSON.stringify(g.members),
       ]);
+    } else {
+      const prev = prevFieldRows.get(g.gid);
+      const changed =
+        !prev ||
+        prev.name !== g.fields.name ||
+        prev.mark !== g.fields.mark ||
+        prev.material !== g.fields.material ||
+        (prev.height === null ? null : Number(prev.height)) !==
+          (g.fields.height === null ? null : Number(g.fields.height)) ||
+        prev.name_src !== g.fieldSources.name ||
+        prev.mark_src !== g.fieldSources.mark ||
+        prev.material_src !== g.fieldSources.material ||
+        prev.height_src !== g.fieldSources.height;
+      if (changed) {
+        groupEventRows.push([
+          version,
+          g.gid,
+          'change',
+          JSON.stringify({ fields: g.fields, fieldSources: g.fieldSources }),
+          null,
+        ]);
+      }
     }
     const prevMembers = new Set(r.prevGid2Members.get(g.gid) || []);
     for (const k of g.members) {
@@ -815,41 +963,79 @@ async function doPublish(db, reason) {
   await insertChunked(db, 'membership_events', ['version', 'k', 'gid', 'op'], leaveRows, '(?, ?, ?, ?)');
   await insertChunked(db, 'membership_events', ['version', 'k', 'gid', 'op'], joinRows, '(?, ?, ?, ?)');
 
-  // 4) 证据留痕：本次比较产生的匹配边（joined）与剪开边（cut）
-  const cutToken = new Set(r.cutEdgesAll.map((e) => [e.k1, e.k2].sort().join('#')));
+  // 4) 证据历史：只在边的有效证据发生变化时追加一条事件。
+  //    某版某边的有效证据 = version<=该版的最新事件（history 不随无关发布增长）。
   const evidenceRows = [];
-  for (const e of r.matchEdges) {
-    const token = [e.k1, e.k2].sort().join('#');
+  const sameEvidence = (prev, cur) =>
+    prev &&
+    // 旧格式事件缺少 contributed / 阻断批次等字段，需在新格式下重记一次，
+    // 但旧版解释仍只读旧事件，不受影响。
+    (prev.formatVersion === null || Number(prev.formatVersion) >= CURRENT_FORMAT) &&
+    prev.outcome === cur.outcome &&
+    prev.contributed === cur.contributed &&
+    Number(prev.confidence) === Number(cur.confidence) &&
+    String(prev.evidence) === String(cur.evidence) &&
+    (prev.blockKind || null) === (cur.blockKind || null) &&
+    (prev.blockBatches || null) === (cur.blockBatches || null);
+  for (const [token, cur] of r.currentEdges) {
+    const prev = r.prevEvidence.get(token);
+    if (sameEvidence(prev, cur)) continue;
     evidenceRows.push([
-      version, e.k1, e.k2, e.confidence,
-      JSON.stringify(e.evidence),
-      cutToken.has(token) ? 'cut' : 'joined',
+      version, CURRENT_FORMAT, cur.k1, cur.k2, cur.confidence,
+      cur.evidence, cur.outcome, cur.contributed === null ? null : !!cur.contributed,
+      cur.blockKind, cur.blockBatches,
+    ]);
+  }
+  // 之前有效、现在不再生效（低于阈值或记录撤回）的边，记一条 removed
+  for (const token of r.removedTokens) {
+    const [k1, k2] = token.split('#');
+    evidenceRows.push([
+      version, CURRENT_FORMAT, k1, k2, null, null, 'removed', null, null, null,
     ]);
   }
   await insertChunked(
     db,
     'evidence_events',
-    ['version', 'k1', 'k2', 'confidence', 'evidence', 'outcome'],
+    ['version', 'format_version', 'k1', 'k2', 'confidence', 'evidence', 'outcome', 'contributed', 'block_kind', 'block_batches'],
     evidenceRows,
-    '(?, ?, ?, ?, ?, ?)'
+    '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   );
+  const evidenceChanges = evidenceRows.length;
 
-  const stats = { ...r.metrics, groupCount: keepCount + r.resultGroups.length };
-  await db.run('insert into publications(version, created_at, reason, stats) values(?, ?, ?, ?)', [
+  // 5) 馆藏证据完整起始版：本次涉及的结果馆藏自本版起被完整跟踪。
+  //    用于判断某馆藏在更早版本的证据是否“升级前无法证实”（缺证）。
+  const evidenceStateRows = [];
+  for (const g of r.resultGroups) evidenceStateRows.push([g.gid, version]);
+  if (evidenceStateRows.length) {
+    for (let s = 0; s < evidenceStateRows.length; s += 200) {
+      const part = evidenceStateRows.slice(s, s + 200);
+      const ph = part.map(() => '(?, ?)').join(',');
+      await db.run(
+        `insert into group_evidence_state(gid, since_version) values ${ph}
+         on conflict(gid) do update set since_version = least(group_evidence_state.since_version, excluded.since_version)`,
+        part.flat()
+      );
+    }
+  }
+
+  const stats = { ...r.metrics, evidenceChanges, groupCount: keepCount + r.resultGroups.length };
+  await db.run('insert into publications(version, created_at, reason, stats, format_version) values(?, ?, ?, ?, ?)', [
     version,
     now(),
     reason,
     JSON.stringify(stats),
+    CURRENT_FORMAT,
   ]);
   await db.run(
-    `insert into recompute_log(version, touched_keys, source_records_read, comparisons, new_group_rows, duration_ms)
-     values(?, ?, ?, ?, ?, ?)`,
+    `insert into recompute_log(version, touched_keys, source_records_read, comparisons, new_group_rows, evidence_changes, duration_ms)
+     values(?, ?, ?, ?, ?, ?, ?)`,
     [
       version,
       JSON.stringify(r.metrics.affectedKeys),
       r.metrics.sourceRecordsRead,
       r.metrics.comparisons,
       r.metrics.newGroupRows,
+      evidenceChanges,
       r.metrics.durationMs,
     ]
   );

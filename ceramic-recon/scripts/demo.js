@@ -111,6 +111,7 @@ function summarize(log) {
     reads: r.source_records_read,
     comparisons: r.comparisons,
     newGroups: r.new_group_rows,
+    evidence: r.evidence_changes,
   }));
 }
 
@@ -172,16 +173,18 @@ async function main() {
   const bigSum = summarize(bigLog);
 
   console.log('\n每次发布的三项工作量（左：干净库 / 右：含 5 万无关记录的大库）：');
-  console.log('次数 | 读取记录(clean/big) | 匹配比较(clean/big) | 新增馆藏(clean/big)');
+  console.log('次数 | 读取记录(clean/big) | 匹配比较(clean/big) | 新增馆藏(clean/big) | 新增证据(clean/big)');
   for (let i = 0; i < cleanSum.length; i++) {
     const c = cleanSum[i];
     const b = bigSum[i];
     const same =
-      c.reads === b.reads && c.comparisons === b.comparisons && c.newGroups === b.newGroups;
+      c.reads === b.reads && c.comparisons === b.comparisons && c.newGroups === b.newGroups &&
+      c.evidence === b.evidence;
     console.log(
       `${String(i + 1).padStart(2)}   | ${String(c.reads).padStart(4)} / ${String(b.reads).padStart(6)}` +
         `       | ${String(c.comparisons).padStart(4)} / ${String(b.comparisons).padStart(6)}` +
         `        | ${String(c.newGroups).padStart(4)} / ${String(b.newGroups).padStart(6)}` +
+        `        | ${String(c.evidence).padStart(3)} / ${String(b.evidence).padStart(3)}` +
         `   ${same ? '✓ 相同' : '✗ 不一致'}`
     );
   }
@@ -192,19 +195,21 @@ async function main() {
         reads: acc.reads + r.reads,
         comparisons: acc.comparisons + r.comparisons,
         newGroups: acc.newGroups + r.newGroups,
+        evidence: acc.evidence + r.evidence,
       }),
-      { reads: 0, comparisons: 0, newGroups: 0 }
+      { reads: 0, comparisons: 0, newGroups: 0, evidence: 0 }
     );
   const tc = totals(cleanSum);
   const tb = totals(bigSum);
   console.log('\n20 次发布累计：');
-  console.log(`  干净库：读取 ${tc.reads} 条，比较 ${tc.comparisons} 次，新增馆藏数据 ${tc.newGroups} 行`);
-  console.log(`  大库  ：读取 ${tb.reads} 条，比较 ${tb.comparisons} 次，新增馆藏数据 ${tb.newGroups} 行`);
+  console.log(`  干净库：读取 ${tc.reads} 条，比较 ${tc.comparisons} 次，新增馆藏数据 ${tc.newGroups} 行，新增证据 ${tc.evidence} 条`);
+  console.log(`  大库  ：读取 ${tb.reads} 条，比较 ${tb.comparisons} 次，新增馆藏数据 ${tb.newGroups} 行，新增证据 ${tb.evidence} 条`);
   const invariantHolds =
-    tc.reads === tb.reads && tc.comparisons === tb.comparisons && tc.newGroups === tb.newGroups;
+    tc.reads === tb.reads && tc.comparisons === tb.comparisons &&
+    tc.newGroups === tb.newGroups && tc.evidence === tb.evidence;
   console.log(
     invariantHolds
-      ? '\n结论 ✓：加入 5 万条无关馆藏后，相同变更的三项工作量完全相同，不随全库规模增长。'
+      ? '\n结论 ✓：加入 5 万条无关馆藏后，相同变更的工作量完全相同，不随全库规模增长。'
       : '\n结论 ✗：工作量随规模发生变化，需要检查分块增量逻辑。'
   );
 

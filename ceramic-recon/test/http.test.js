@@ -117,3 +117,53 @@ test('HTTP 健康检查与重复批次冲突', async () => {
     await new Promise((r) => server.close(r));
   }
 });
+
+test('HTTP 单馆藏复核与按版本解释：间接阻断、判异撤回后重新归并', async () => {
+  const { c, server } = await startServer();
+  try {
+    await c.post('/batches/imports', {
+      batchId: 'bA', source: 'registry',
+      records: [{ id: 'A', name: '青釉梅瓶', mark: '甲款', height: 20 }],
+    });
+    await c.post('/batches/imports', {
+      batchId: 'bB', source: 'repair',
+      records: [{ id: 'B', name: '青釉梅缾', mark: '甲款', material: '瓷', height: 20 }],
+    });
+    await c.post('/batches/imports', {
+      batchId: 'bC', source: 'inventory',
+      records: [{ id: 'C', name: '青釉梅缾', mark: '甲款', height: 20.4 }],
+    });
+    await c.post('/publications', {});
+    const v1 = (await c.get('/groups')).groups[0];
+    await c.post('/batches/heterologies', {
+      batchId: 'hAC', source1: 'registry', id1: 'A', source2: 'inventory', id2: 'C',
+    });
+    await c.post('/publications', {});
+
+    const groups = (await c.get('/groups')).groups;
+    const cg = groups.find((g) => g.members.join(',') === 'inventory|C');
+    const g = await c.get(`/groups/${cg.gid}`);
+    const rejected = new Map(g.group.rejectedEdges.map((e) => [`${e.k1}#${e.k2}`, e]));
+    assert.equal(rejected.get('inventory|C#registry|A').blockKind, 'direct');
+    assert.equal(rejected.get('inventory|C#repair|B').blockKind, 'indirect');
+    assert.deepEqual(rejected.get('inventory|C#repair|B').blockedByBatches, ['hAC']);
+
+    // 撤回判异并发布，三条重新归并；旧版解释按当时结果显示
+    await c.post('/batches/withdrawals', { batchId: 'hAC' });
+    await c.post('/publications', {});
+    const mergedGid = (await c.get('/groups')).groups[0].gid;
+    const merged = await c.get(`/groups/${mergedGid}`);
+    assert.equal(merged.group.rejectedEdges.length, 0);
+    assert.equal(merged.group.contributingEdges.length, 2);
+
+    // 指定旧版本查询：仍是拆分态，解释里带当时的判异批次
+    const atV2 = await c.get(`/groups/${cg.gid}?atVersion=2`);
+    assert.equal(atV2.version, 2);
+    assert.ok(atV2.group.rejectedEdges.every((e) => e.blockedByBatches.includes('hAC')));
+    // v1 的馆藏仍可查询
+    const atV1 = await c.get(`/groups/${v1.gid}?atVersion=1`);
+    assert.equal(atV1.group.members.length, 3);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});

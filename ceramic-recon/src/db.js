@@ -95,7 +95,9 @@ create table if not exists publications(
   version integer primary key,
   created_at bigint not null,
   reason varchar,
-  stats varchar not null
+  stats varchar not null,
+  -- 2 = 带逐版证据历史语义；旧库经迁移后既有版本标为 1（解释缺证）
+  format_version integer not null default 2
 );
 create table if not exists group_lineage(
   gid varchar primary key,
@@ -108,6 +110,7 @@ create table if not exists recompute_log(
   source_records_read integer not null,
   comparisons integer not null,
   new_group_rows integer not null,
+  evidence_changes integer not null default 0,
   duration_ms integer not null
 );
 create table if not exists outbox(
@@ -155,19 +158,35 @@ create table if not exists membership_events(
   gid varchar,
   op varchar not null
 );
+-- 证据历史：只记录“发生变化的边”。某版某条边的有效证据取 version<=该版的最新事件。
+-- outcome: joined（实际促成归并）/ cut（被拒匹配边）/ removed（边消失或不再达到阈值）
+-- block_kind / block_batches：cut 时记录当时阻断它的判异批次（direct 直判异 / indirect 间接阻断）
 create table if not exists evidence_events(
   event_id bigint primary key default nextval('rv_seq'),
   version integer not null,
+  format_version integer not null default 2,
   k1 varchar not null,
   k2 varchar not null,
-  confidence double not null,
-  evidence varchar not null,
-  outcome varchar not null
+  confidence double,
+  evidence varchar,
+  outcome varchar not null,
+  contributed boolean,
+  block_kind varchar,
+  block_batches varchar
+);
+-- 馆藏证据完整起始版：自该版起该馆藏的证据历史被完整跟踪（升级前的老馆藏无此记录 ⇒ 缺证）
+create table if not exists group_evidence_state(
+  gid varchar primary key,
+  since_version integer not null
 );
 create index if not exists idx_group_events_ver on group_events(version);
 create index if not exists idx_membership_events_ver on membership_events(version);
 create index if not exists idx_membership_events_k on membership_events(k);
+create index if not exists idx_membership_events_gid on membership_events(gid);
 create index if not exists idx_evidence_ver on evidence_events(version);
+create index if not exists idx_evidence_k1 on evidence_events(k1);
+create index if not exists idx_evidence_k2 on evidence_events(k2);
+create index if not exists idx_evidence_edge on evidence_events(k1, k2, version);
 create view if not exists v_active_records as
 select rv.*
 from record_versions rv
@@ -184,10 +203,58 @@ from heterology_edges
 where withdrawn_at is null;
 `;
 
+const CURRENT_FORMAT = 2;
+
+// 旧库升级：补齐新列，把既有版本标记为旧格式（1），其解释视为缺证。
+// 幂等：重复执行无副作用。
+async function migrate(db) {
+  const cols = async (table) =>
+    (await db.all(
+      `select column_name from information_schema.columns where table_name = ?`,
+      [table]
+    )).map((r) => r.column_name);
+  const addCol = async (table, col, decl) => {
+    const have = await cols(table);
+    if (!have.includes(col)) await db.run(`alter table ${table} add column ${col} ${decl}`);
+  };
+
+  await addCol('publications', 'format_version', `integer default ${CURRENT_FORMAT - 1}`);
+  await addCol('recompute_log', 'evidence_changes', 'integer default 0');
+  await addCol('evidence_events', 'format_version', 'integer default 1');
+  await addCol('evidence_events', 'block_kind', 'varchar');
+  await addCol('evidence_events', 'block_batches', 'varchar');
+  await addCol('evidence_events', 'contributed', 'boolean');
+  // evidence_events.confidence / evidence 在旧库中为 not null；缺证行允许为空
+  try {
+    await db.run('alter table evidence_events alter column confidence drop not null');
+  } catch {
+    /* 已可空 */
+  }
+  try {
+    await db.run('alter table evidence_events alter column evidence drop not null');
+  } catch {
+    /* 已可空 */
+  }
+  // 迁移前已存在的版本，其证据历史不完整 → 标记为旧格式（format_version = 1）
+  await db.run(`update publications set format_version = ${CURRENT_FORMAT - 1} where format_version is null`);
+  await db.run('update publications set format_version = 1 where format_version = 0');
+  await db.run('update recompute_log set evidence_changes = 0 where evidence_changes is null');
+  await db.run('update evidence_events set format_version = 1 where format_version is null');
+}
+
 async function initDatabase(db) {
   for (const stmt of SCHEMA.split(';').map((s) => s.trim()).filter(Boolean)) {
     await db.run(stmt);
   }
+  await migrate(db);
 }
 
-module.exports = { openDatabase, initDatabase, SOURCES, SOURCE_LABEL, keyOf, parseKey };
+module.exports = {
+  openDatabase,
+  initDatabase,
+  CURRENT_FORMAT,
+  SOURCES,
+  SOURCE_LABEL,
+  keyOf,
+  parseKey,
+};

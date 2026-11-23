@@ -62,7 +62,8 @@ function createServer(deps) {
       }
       if (req.method === 'GET' && p.startsWith('/groups/')) {
         const gid = decodeURIComponent(p.slice('/groups/'.length));
-        const out = await queries.getGroup(db, gid);
+        const at = url.searchParams.get('atVersion');
+        const out = await queries.getGroup(db, gid, at ? parseInt(at, 10) : null);
         return out ? json(res, 200, out) : json(res, 404, { error: '馆藏不存在或尚未发布' });
       }
       if (req.method === 'GET' && p.startsWith('/records/')) {
